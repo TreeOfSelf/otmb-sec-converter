@@ -340,6 +340,99 @@ def generate_materials_xml(output_path):
     print(f"Generated {output_path}")
 
 
+def parse_mon_files(mon_dir):
+    """Parse all .mon files to extract creature data"""
+    import re
+    
+    creatures = []
+    mon_files = sorted(Path(mon_dir).glob('*.mon'))
+    
+    for mon_file in mon_files:
+        try:
+            content = mon_file.read_text(encoding='latin-1', errors='ignore')
+            
+            race_num = None
+            name = None
+            outfit = None
+            
+            for line in content.split('\n'):
+                line = line.strip()
+                
+                if line.startswith('RaceNumber'):
+                    match = re.search(r'=\s*(\d+)', line)
+                    if match:
+                        race_num = int(match.group(1))
+                
+                elif line.startswith('Name'):
+                    match = re.search(r'=\s*"([^"]+)"', line)
+                    if match:
+                        name = match.group(1)
+                
+                elif line.startswith('Outfit'):
+                    match = re.search(r'\((\d+),\s*(\d+)-(\d+)-(\d+)-(\d+)\)', line)
+                    if match:
+                        outfit = {
+                            'looktype': int(match.group(1)),
+                            'head': int(match.group(2)),
+                            'body': int(match.group(3)),
+                            'legs': int(match.group(4)),
+                            'feet': int(match.group(5))
+                        }
+            
+            if race_num and name and outfit:
+                creatures.append({
+                    'race': race_num,
+                    'name': name,
+                    'outfit': outfit
+                })
+        
+        except Exception:
+            continue
+    
+    return creatures
+
+
+def generate_creatures_xml(mon_dir, output_path):
+    """Generate creatures.xml from .mon files"""
+    creatures = parse_mon_files(mon_dir)
+    
+    # Sort by name
+    creatures.sort(key=lambda c: c['name'].lower())
+    
+    xml_lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<creatures>',
+        '\t<!-- this file is for indexing only -->',
+        '\t<!-- for sorting see creature_palette.xml -->'
+    ]
+    
+    for creature in creatures:
+        name = creature['name']
+        looktype = creature['outfit']['looktype']
+        head = creature['outfit']['head']
+        body = creature['outfit']['body']
+        legs = creature['outfit']['legs']
+        feet = creature['outfit']['feet']
+        
+        # If all colors are 0, don't include them
+        if head == 0 and body == 0 and legs == 0 and feet == 0:
+            xml_lines.append(f'\t<creature name="{name}" type="monster" looktype="{looktype}"/>')
+        else:
+            xml_lines.append(
+                f'\t<creature name="{name}" type="monster" '
+                f'looktype="{looktype}" lookhead="{head}" lookbody="{body}" '
+                f'looklegs="{legs}" lookfeet="{feet}"/>'
+            )
+    
+    xml_lines.append('</creatures>')
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(xml_lines))
+    
+    print(f"Generated {output_path} ({len(creatures)} creatures)")
+
+
 def generate_clients_xml_snippet(output_dir):
     """Generate clients.xml snippet to manually add to RME"""
     dat_sig, spr_sig = get_dat_spr_signatures()
@@ -367,6 +460,7 @@ def generate_clients_xml_snippet(output_dir):
 def main():
     # Paths
     objects_srv = Path('assets/objects.srv')
+    mon_dir = Path('assets/mon')
     output_base = Path('output/rme_config')
     data_dir = output_base / 'data' / '770'
     
@@ -384,6 +478,11 @@ def main():
     generate_items_otb(items, data_dir / 'items.otb')
     generate_items_xml(items, data_dir / 'items.xml')
     generate_materials_xml(data_dir / 'materials.xml')
+    
+    # Generate creatures.xml if .mon files exist
+    if mon_dir.exists():
+        generate_creatures_xml(mon_dir, data_dir / 'creatures.xml')
+    
     generate_clients_xml_snippet(output_base)
     
     print()
