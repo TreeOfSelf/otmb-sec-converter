@@ -2,3 +2,5 @@ assets/
 logs/
 output/
 RME/
+__pycache__/
+*.pyc
