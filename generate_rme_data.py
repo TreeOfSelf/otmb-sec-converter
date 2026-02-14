@@ -129,7 +129,7 @@ def generate_items_otb(items, output_path):
     csd = b'OTB 1.0.0-7.70-cipsoft\x00'
     data.extend(csd + b'\x00' * (128 - len(csd)))
     
-    # Generate item nodes (exclude items with empty names)
+    # Generate item nodes (skip items with empty names)
     item_count = 0
     for type_id in sorted(items.keys()):
         item = items[type_id]
@@ -167,7 +167,7 @@ def generate_items_otb(items, output_path):
         item_data.extend(struct.pack('<H', 2))  # length
         item_data.extend(struct.pack('<H', type_id))
         
-        # Name attribute
+        # Name attribute (use name even if empty - RME will handle it)
         name_bytes = item['name'].encode('latin-1', errors='ignore')
         item_data.append(ITEM_ATTR_NAME)
         item_data.extend(struct.pack('<H', len(name_bytes)))
@@ -207,8 +207,8 @@ def generate_items_xml(items, output_path):
     for type_id in sorted(items.keys()):
         item = items[type_id]
         
-        # Skip ID 0 (RME rejects it) and empty names
-        if type_id == 0 or not item['name']:
+        # Skip items with empty names
+        if not item['name']:
             continue
         
         item_elem = etree.SubElement(root, 'item')
@@ -381,7 +381,7 @@ def generate_creatures_xml(creatures, output_path):
 
 def generate_creature_palette_xml(creatures, output_path):
     """Generate creature_palette.xml with single category"""
-    root = etree.Element('materialsextension')
+    root = etree.Element('materials')
     root.text = '\n\t'
     
     # Single tileset called "Creatures"
@@ -389,17 +389,22 @@ def generate_creature_palette_xml(creatures, output_path):
     tileset.text = '\n\t\t'
     tileset.tail = '\n'
     
+    # Create <creatures> wrapper inside tileset
+    creatures_wrapper = etree.SubElement(tileset, 'creatures')
+    creatures_wrapper.text = '\n\t\t\t'
+    creatures_wrapper.tail = '\n\t'
+    
     # Add all creatures sorted by name
     creature_list = sorted(creatures.items(), key=lambda x: x[1]['name'].lower())
     
     for i, (creature_name, creature) in enumerate(creature_list):
-        creature_elem = etree.SubElement(tileset, 'creature', name=creature['name'])
+        creature_elem = etree.SubElement(creatures_wrapper, 'creature', name=creature['name'])
         
         # Set tail for proper formatting
         if i < len(creature_list) - 1:
-            creature_elem.tail = '\n\t\t'
+            creature_elem.tail = '\n\t\t\t'
         else:
-            creature_elem.tail = '\n\t'
+            creature_elem.tail = '\n\t\t'
     
     tree = etree.ElementTree(root)
     tree.write(output_path, encoding='utf-8', xml_declaration=True)
@@ -407,7 +412,7 @@ def generate_creature_palette_xml(creatures, output_path):
 
 def generate_raw_palette_xml(items, output_path):
     """Generate raw_palette.xml with all items in one category"""
-    root = etree.Element('materialsextension')
+    root = etree.Element('materials')
     root.text = '\n\t'
     
     # Single tileset called "Items"
@@ -415,18 +420,23 @@ def generate_raw_palette_xml(items, output_path):
     tileset.text = '\n\t\t'
     tileset.tail = '\n'
     
-    # Add all items sorted by ID
+    # Create <raw> wrapper inside tileset
+    raw_wrapper = etree.SubElement(tileset, 'raw')
+    raw_wrapper.text = '\n\t\t\t'
+    raw_wrapper.tail = '\n\t'
+    
+    # Add all items with names, sorted by ID
     item_list = [(type_id, item) for type_id, item in items.items() if item['name']]
     item_list.sort(key=lambda x: x[0])
     
     for i, (type_id, item) in enumerate(item_list):
-        item_elem = etree.SubElement(tileset, 'item', id=str(type_id))
+        item_elem = etree.SubElement(raw_wrapper, 'item', id=str(type_id))
         
         # Set tail for proper formatting
         if i < len(item_list) - 1:
-            item_elem.tail = '\n\t\t'
+            item_elem.tail = '\n\t\t\t'
         else:
-            item_elem.tail = '\n\t'
+            item_elem.tail = '\n\t\t'
     
     tree = etree.ElementTree(root)
     tree.write(output_path, encoding='utf-8', xml_declaration=True)
