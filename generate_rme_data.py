@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-Complete RME data generator for 7.70 CipSoft TypeIDs
-Generates all necessary files from CipSoft game data + 760 reference XMLs
+RME Configuration Generator for 7.70 CipSoft TypeIDs
+Generates ONLY RME configuration files (NOT map conversion)
+
+Input:  tibia-game folder
+Output: output/rme_config/data/770/ (items.otb, items.xml, creatures.xml, palettes)
+
+For map conversion, use sec_to_otbm.py separately.
 """
+import sys
 import os
 import struct
 from pathlib import Path
 from lxml import etree
-
+from collections import defaultdict
 
 # ============================================================================
 # OTB/OTBM Constants
@@ -37,9 +43,70 @@ ESC_CHAR = 0xFD
 NODE_START = 0xFE
 NODE_END = 0xFF
 
+# OTBM Node Types
+SECTOR_SIZE = 32
+NODE_ESC = 0xFD
+NODE_INIT = 0xFE
+NODE_TERM = 0xFF
+
+OTBM_MAP_HEADER = 0x00
+OTBM_MAP_DATA = 0x02
+OTBM_TILE_AREA = 0x04
+OTBM_TILE = 0x05
+OTBM_ITEM = 0x06
+OTBM_ATTR_DESCRIPTION = 0x01
+
 
 # ============================================================================
-# Step 1: Parse objects.srv for 770 items
+# OTBM Writer
+# ============================================================================
+class OTBMWriter:
+    """Handles writing OTBM files with proper escape sequences"""
+    
+    def __init__(self):
+        self.data = bytearray()
+    
+    def write_byte(self, b):
+        """Write a byte with escape handling"""
+        if b in (NODE_ESC, NODE_INIT, NODE_TERM):
+            self.data.append(NODE_ESC)
+        self.data.append(b)
+    
+    def write_uint16(self, val):
+        """Write uint16 (little-endian) with escape handling"""
+        self.write_byte(val & 0xFF)
+        self.write_byte((val >> 8) & 0xFF)
+    
+    def write_uint32(self, val):
+        """Write uint32 (little-endian) with escape handling"""
+        self.write_byte(val & 0xFF)
+        self.write_byte((val >> 8) & 0xFF)
+        self.write_byte((val >> 16) & 0xFF)
+        self.write_byte((val >> 24) & 0xFF)
+    
+    def write_string(self, s):
+        """Write string with length prefix"""
+        encoded = s.encode('latin-1')
+        self.write_uint16(len(encoded))
+        for b in encoded:
+            self.write_byte(b)
+    
+    def start_node(self, node_type):
+        """Start a new node"""
+        self.data.append(NODE_INIT)
+        self.write_byte(node_type)
+    
+    def end_node(self):
+        """End current node"""
+        self.data.append(NODE_TERM)
+    
+    def get_bytes(self):
+        """Return the complete byte array"""
+        return bytes(self.data)
+
+
+# ============================================================================
+# Step 1: Parse objects.srv for items
 # ============================================================================
 def parse_objects_srv(objects_srv_path):
     """Parse CipSoft objects.srv to extract item definitions"""
@@ -95,7 +162,7 @@ def parse_objects_srv(objects_srv_path):
 
 
 # ============================================================================
-# Step 3: Generate items.otb with proper binary format
+# Step 2: Generate items.otb with proper binary format
 # ============================================================================
 def escape_otb_data(data):
     """Escape special bytes in OTB data"""
@@ -167,7 +234,7 @@ def generate_items_otb(items, output_path):
         item_data.extend(struct.pack('<H', 2))  # length
         item_data.extend(struct.pack('<H', type_id))
         
-        # Name attribute (use name even if empty - RME will handle it)
+        # Name attribute
         name_bytes = item['name'].encode('latin-1', errors='ignore')
         item_data.append(ITEM_ATTR_NAME)
         item_data.extend(struct.pack('<H', len(name_bytes)))
@@ -198,7 +265,7 @@ def generate_items_otb(items, output_path):
 
 
 # ============================================================================
-# Step 4: Generate items.xml
+# Step 3: Generate items.xml
 # ============================================================================
 def generate_items_xml(items, output_path):
     """Generate items.xml for RME"""
@@ -246,7 +313,7 @@ def generate_items_xml(items, output_path):
 
 
 # ============================================================================
-# Step 5: Parse .mon files and generate creatures.xml
+# Step 4: Parse .mon files and generate creatures.xml
 # ============================================================================
 def parse_mon_files(mon_dir):
     """Parse .mon files to extract creature definitions using FILENAME as name"""
@@ -301,6 +368,7 @@ def parse_mon_files(mon_dir):
         if looktype:
             creatures[creature_name] = {
                 'name': creature_name,
+                'race_number': race_number,
                 'looktype': looktype,
                 'lookhead': lookhead,
                 'lookbody': lookbody,
@@ -312,10 +380,7 @@ def parse_mon_files(mon_dir):
 
 
 def generate_creatures_xml(creatures, output_path):
-    """
-    Generate creatures.xml directly from .mon files (no merging)
-    Uses filename as creature name to avoid collisions
-    """
+    """Generate creatures.xml directly from .mon files"""
     all_creatures = []
     
     # Add all creatures from .mon files
@@ -336,7 +401,7 @@ def generate_creatures_xml(creatures, output_path):
     
     # Build new tree with proper formatting
     root = etree.Element('creatures')
-    root.text = '\n\t'  # Newline + tab after opening tag
+    root.text = '\n\t'
     
     comment1 = etree.Comment(' this file is for indexing only ')
     comment1.tail = '\n\t'
@@ -351,11 +416,9 @@ def generate_creatures_xml(creatures, output_path):
         creature_elem.set('name', c['name'])
         creature_elem.set('type', c['type'])
         
-        # Only set looktype if it exists
         if c['looktype']:
             creature_elem.set('looktype', c['looktype'])
         
-        # Add optional color attributes
         if c['lookhead']:
             creature_elem.set('lookhead', c['lookhead'])
         if c['lookbody']:
@@ -365,11 +428,10 @@ def generate_creatures_xml(creatures, output_path):
         if c['lookfeet']:
             creature_elem.set('lookfeet', c['lookfeet'])
         
-        # Set tail for proper indentation
         if i < len(all_creatures) - 1:
             creature_elem.tail = '\n\t'
         else:
-            creature_elem.tail = '\n'  # Last element
+            creature_elem.tail = '\n'
         
         root.append(creature_elem)
     
@@ -384,23 +446,19 @@ def generate_creature_palette_xml(creatures, output_path):
     root = etree.Element('materials')
     root.text = '\n\t'
     
-    # Single tileset called "Creatures"
     tileset = etree.SubElement(root, 'tileset', name='Creatures')
     tileset.text = '\n\t\t'
     tileset.tail = '\n'
     
-    # Create <creatures> wrapper inside tileset
     creatures_wrapper = etree.SubElement(tileset, 'creatures')
     creatures_wrapper.text = '\n\t\t\t'
     creatures_wrapper.tail = '\n\t'
     
-    # Add all creatures sorted by name
     creature_list = sorted(creatures.items(), key=lambda x: x[1]['name'].lower())
     
     for i, (creature_name, creature) in enumerate(creature_list):
         creature_elem = etree.SubElement(creatures_wrapper, 'creature', name=creature['name'])
         
-        # Set tail for proper formatting
         if i < len(creature_list) - 1:
             creature_elem.tail = '\n\t\t\t'
         else:
@@ -415,24 +473,20 @@ def generate_raw_palette_xml(items, output_path):
     root = etree.Element('materials')
     root.text = '\n\t'
     
-    # Single tileset called "Items"
     tileset = etree.SubElement(root, 'tileset', name='Items')
     tileset.text = '\n\t\t'
     tileset.tail = '\n'
     
-    # Create <raw> wrapper inside tileset
     raw_wrapper = etree.SubElement(tileset, 'raw')
     raw_wrapper.text = '\n\t\t\t'
     raw_wrapper.tail = '\n\t'
     
-    # Add all items with names, sorted by ID
     item_list = [(type_id, item) for type_id, item in items.items() if item['name']]
     item_list.sort(key=lambda x: x[0])
     
     for i, (type_id, item) in enumerate(item_list):
         item_elem = etree.SubElement(raw_wrapper, 'item', id=str(type_id))
         
-        # Set tail for proper formatting
         if i < len(item_list) - 1:
             item_elem.tail = '\n\t\t\t'
         else:
@@ -443,69 +497,639 @@ def generate_raw_palette_xml(items, output_path):
 
 
 # ============================================================================
-# Main generation workflow
+# Step 5: Parse .sec files (map data)
+# ============================================================================
+def parse_sec_file(sec_file):
+    """Parse a single .sec file and return tiles with items"""
+    tiles = []
+    
+    with open(sec_file, 'r', encoding='latin-1', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            
+            if not line or line.startswith('#'):
+                continue
+            
+            if ':' not in line or 'Content=' not in line:
+                continue
+            
+            try:
+                coords_part, rest = line.split(':', 1)
+                lx, ly = map(int, coords_part.strip().split('-'))
+                
+                if 'Refresh' in rest:
+                    rest = rest.replace('Refresh,', '').replace('Refresh', '')
+                
+                if 'Content={' not in rest:
+                    continue
+                
+                try:
+                    content_part = rest.split('Content={', 1)[1]
+                    if '}' not in content_part:
+                        continue
+                    content_str = content_part.split('}', 1)[0]
+                except IndexError:
+                    continue
+                    
+                if not content_str.strip():
+                    continue
+                
+                items = []
+                for item_str in content_str.split(','):
+                    item_str = item_str.strip()
+                    if not item_str:
+                        continue
+                    
+                    parts = item_str.split()
+                    
+                    try:
+                        item_id = int(parts[0])
+                    except (ValueError, IndexError):
+                        continue
+                    
+                    item_data = {'id': item_id}
+                    
+                    for part in parts[1:]:
+                        if '=' in part:
+                            key, value = part.split('=', 1)
+                            try:
+                                item_data[key.lower()] = int(value)
+                            except ValueError:
+                                pass
+                    
+                    items.append(item_data)
+                
+                if items:
+                    tiles.append((lx, ly, items))
+                    
+            except (ValueError, IndexError):
+                continue
+    
+    return tiles
+
+
+def load_all_sectors(sec_dir):
+    """Load all .sec files and organize by sector"""
+    sec_dir = Path(sec_dir)
+    sectors = defaultdict(list)
+    
+    print(f"Scanning for .sec files in {sec_dir}...")
+    sec_files = sorted(sec_dir.glob("*.sec"))
+    total_files = len(sec_files)
+    print(f"  Found {total_files} sector files.")
+    
+    parsed = 0
+    skipped = 0
+    
+    for idx, sec_file in enumerate(sec_files, 1):
+        if idx % 500 == 0:
+            print(f"  Progress: {idx}/{total_files} files ({parsed} parsed, {skipped} skipped)")
+        
+        try:
+            name_parts = sec_file.stem.split('-')
+            sx = int(name_parts[0])
+            sy = int(name_parts[1])
+            z = int(name_parts[2])
+            
+            tiles = parse_sec_file(sec_file)
+            if tiles:
+                sectors[(sx, sy, z)].extend(tiles)
+                parsed += 1
+            else:
+                skipped += 1
+        except (ValueError, IndexError):
+            skipped += 1
+            continue
+        except Exception:
+            skipped += 1
+            continue
+    
+    print(f"  Loaded {len(sectors)} sectors with tiles (parsed: {parsed}, skipped: {skipped}).")
+    return sectors
+
+
+def calculate_offset(sectors):
+    """Calculate the offset needed to move map to start at 0,0"""
+    min_x = min_y = float('inf')
+    
+    for (sx, sy, z), tiles in sectors.items():
+        for lx, ly, _ in tiles:
+            abs_x = sx * SECTOR_SIZE + lx
+            abs_y = sy * SECTOR_SIZE + ly
+            min_x = min(min_x, abs_x)
+            min_y = min(min_y, abs_y)
+    
+    return int(min_x), int(min_y)
+
+
+def calculate_bounds(sectors, offset_x=0, offset_y=0):
+    """Calculate transformed map bounds after applying offset"""
+    min_x = min_y = float('inf')
+    max_x = max_y = float('-inf')
+
+    for (sx, sy, _z), tiles in sectors.items():
+        for lx, ly, _items in tiles:
+            abs_x = sx * SECTOR_SIZE + lx
+            abs_y = sy * SECTOR_SIZE + ly
+            new_x = abs_x - offset_x
+            new_y = abs_y - offset_y
+            min_x = min(min_x, new_x)
+            min_y = min(min_y, new_y)
+            max_x = max(max_x, new_x)
+            max_y = max(max_y, new_y)
+
+    if min_x == float('inf'):
+        return 0, 0, 0, 0
+    return int(min_x), int(min_y), int(max_x), int(max_y)
+
+
+def build_otbm_header(width, height):
+    """Build OTBM header for CipSoft 7.7 (OTB ID 100)"""
+    writer = OTBMWriter()
+    writer.start_node(OTBM_MAP_HEADER)
+    writer.write_uint32(1)    # OTBM version
+    writer.write_uint16(width)
+    writer.write_uint16(height)
+    writer.write_uint32(1)    # OTB major version
+    writer.write_uint32(100)  # OTB minor version (ID 100 = CipSoft 7.7)
+    return writer.get_bytes()
+
+
+def convert_map_to_otbm(sec_dir, output_file, map_name, apply_offset=True):
+    """Convert .sec files to OTBM format"""
+    
+    print("\n" + "="*70)
+    print("GENERATING MAP (OTBM)")
+    print("="*70)
+    
+    sectors = load_all_sectors(sec_dir)
+    
+    if not sectors:
+        print("Error: No valid sectors found!")
+        return
+    
+    offset_x, offset_y = calculate_offset(sectors)
+    
+    if apply_offset:
+        print(f"\nApplying coordinate offset: -{offset_x}, -{offset_y}")
+    else:
+        print(f"\nNOT applying offset (using original coordinates)")
+        offset_x = 0
+        offset_y = 0
+    
+    min_x, min_y, max_x, max_y = calculate_bounds(sectors, offset_x, offset_y)
+    width = max_x - min_x + 1
+    height = max_y - min_y + 1
+
+    width = max(1, min(65535, width))
+    height = max(1, min(65535, height))
+
+    print(f"\nMap bounds: X={min_x}..{max_x} (w={width}), Y={min_y}..{max_y} (h={height})")
+
+    header = build_otbm_header(width, height)
+    
+    writer = OTBMWriter()
+    writer.data.extend(header)
+    
+    print("\nWriting OTBM structure...")
+    
+    writer.start_node(OTBM_MAP_DATA)
+    writer.write_byte(OTBM_ATTR_DESCRIPTION)
+    writer.write_string(map_name)
+    
+    areas = defaultdict(list)
+    for (sx, sy, z), tiles in sectors.items():
+        for lx, ly, items in tiles:
+            abs_x = sx * SECTOR_SIZE + lx
+            abs_y = sy * SECTOR_SIZE + ly
+            
+            new_x = abs_x - offset_x
+            new_y = abs_y - offset_y
+            
+            area_x = new_x & 0xFF00
+            area_y = new_y & 0xFF00
+            local_x = new_x & 0xFF
+            local_y = new_y & 0xFF
+            
+            areas[(area_x, area_y, z)].append({
+                'x': local_x,
+                'y': local_y,
+                'items': items
+            })
+    
+    print(f"  Writing {len(areas)} tile areas...")
+    
+    total_tiles = 0
+    total_items = 0
+    
+    for idx, ((bx, by, z), tiles) in enumerate(sorted(areas.items())):
+        writer.start_node(OTBM_TILE_AREA)
+        writer.write_uint16(bx)
+        writer.write_uint16(by)
+        writer.write_byte(z)
+        
+        for tile in tiles:
+            total_tiles += 1
+            items = tile['items']
+            
+            if not items:
+                continue
+            
+            writer.start_node(OTBM_TILE)
+            writer.write_byte(tile['x'])
+            writer.write_byte(tile['y'])
+            
+            for item_data in items:
+                writer.start_node(OTBM_ITEM)
+                writer.write_uint16(item_data['id'])
+                writer.end_node()
+                total_items += 1
+            
+            writer.end_node()
+        
+        writer.end_node()
+        
+        if idx % 200 == 0:
+            print(f"  Progress: {idx}/{len(areas)} areas...")
+    
+    writer.end_node()
+    writer.end_node()
+    
+    Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(output_file, 'wb') as f:
+        f.write(b'OTBM')
+        f.write(writer.get_bytes())
+    
+    print(f"\n✓ Map generated: {output_file}")
+    print(f"  Tiles: {total_tiles:,}, Items: {total_items:,}")
+
+
+# ============================================================================
+# Step 6: Parse houseareas.dat and houses.dat, generate houses XML
+# ============================================================================
+def parse_houseareas(houseareas_path):
+    """Parse houseareas.dat to get Area → Depot mapping"""
+    area_to_depot = {}
+    
+    with open(houseareas_path, 'r', encoding='latin-1', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            
+            if line.startswith('Area'):
+                try:
+                    content = line.split('=', 1)[1].strip()
+                    content = content.strip('()')
+                    parts = content.split(',')
+                    
+                    area_id = int(parts[0].strip())
+                    depot = int(parts[3].strip())
+                    
+                    area_to_depot[area_id] = depot
+                except (ValueError, IndexError):
+                    continue
+    
+    return area_to_depot
+
+
+def parse_houses_dat(houses_path):
+    """Parse houses.dat file"""
+    houses = []
+    
+    with open(houses_path, 'r', encoding='latin-1', errors='ignore') as f:
+        lines = f.readlines()
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        
+        if line.startswith('ID'):
+            house = {}
+            
+            try:
+                house['id'] = int(line.split('=')[1].strip())
+            except:
+                i += 1
+                continue
+            
+            i += 1
+            while i < len(lines):
+                line = lines[i].strip()
+                
+                if line.startswith('ID'):
+                    i -= 1
+                    break
+                
+                if line.startswith('Name'):
+                    house['name'] = line.split('=', 1)[1].strip().strip('"')
+                elif line.startswith('RentOffset'):
+                    house['rent'] = int(line.split('=')[1].strip())
+                elif line.startswith('Area'):
+                    house['area'] = int(line.split('=')[1].strip())
+                elif line.startswith('GuildHouse'):
+                    house['guildhall'] = line.split('=')[1].strip().lower() == 'true'
+                elif line.startswith('Exit'):
+                    coords = line.split('=')[1].strip().strip('[]')
+                    parts = coords.split(',')
+                    house['entryx'] = int(parts[0])
+                    house['entryy'] = int(parts[1])
+                    house['entryz'] = int(parts[2])
+                elif line.startswith('Fields'):
+                    fields_str = line.split('=')[1].strip()
+                    fields_str = fields_str.strip('{}')
+                    house['size'] = fields_str.count('[')
+                
+                i += 1
+                if not line:
+                    break
+            
+            houses.append(house)
+        else:
+            i += 1
+    
+    return houses
+
+
+def generate_houses_xml(houses_path, houseareas_path, output_path):
+    """Generate map-houses.xml from houses.dat"""
+    
+    print("\n" + "="*70)
+    print("GENERATING HOUSES XML")
+    print("="*70)
+    
+    area_to_depot = parse_houseareas(houseareas_path)
+    houses = parse_houses_dat(houses_path)
+    
+    print(f"Found {len(houses)} houses")
+    
+    xml_lines = ['<?xml version="1.0"?>']
+    xml_lines.append('<houses>')
+    
+    for house in houses:
+        area = house.get('area', 100)
+        house_id = house['id'] - (area * 100)
+        depot = area_to_depot.get(area, 0)
+        town_id = depot + 1
+        
+        attrs = [
+            f'name="{house.get("name", "")}"',
+            f'houseid="{house_id}"',
+            f'entryx="{house.get("entryx", 0)}"',
+            f'entryy="{house.get("entryy", 0)}"',
+            f'entryz="{house.get("entryz", 7)}"',
+            f'rent="{house.get("rent", 0)}"',
+        ]
+        
+        if house.get('guildhall', False):
+            attrs.append('guildhall="true"')
+        
+        attrs.append(f'townid="{town_id}"')
+        attrs.append(f'size="{house.get("size", 0)}"')
+        
+        xml_lines.append(f'\t<house {" ".join(attrs)} />')
+    
+    xml_lines.append('</houses>')
+    
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(xml_lines))
+    
+    print(f"✓ Houses XML generated: {len(houses)} houses")
+
+
+# ============================================================================
+# Step 7: Build race lookup and generate spawns XML
+# ============================================================================
+def build_race_lookup(creatures):
+    """Build Race → Monster Name lookup from creatures dict"""
+    race_to_name = {}
+    
+    for creature_name, creature in creatures.items():
+        race_number = creature.get('race_number')
+        if race_number is not None:
+            race_to_name[race_number] = creature['name']
+    
+    return race_to_name
+
+
+def parse_monsters_db(monsters_db_path):
+    """Parse monsters.db file"""
+    spawns = []
+    
+    with open(monsters_db_path, 'r', encoding='latin-1', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            
+            if not line or line.startswith('#'):
+                continue
+            
+            parts = line.split()
+            if len(parts) < 7:
+                continue
+            
+            try:
+                spawn = {
+                    'race': int(parts[0]),
+                    'x': int(parts[1]),
+                    'y': int(parts[2]),
+                    'z': int(parts[3]),
+                    'radius': int(parts[4]),
+                    'amount': int(parts[5]),
+                    'spawntime': int(parts[6])
+                }
+                spawns.append(spawn)
+            except (ValueError, IndexError):
+                continue
+    
+    return spawns
+
+
+def parse_npc_files(npc_dir):
+    """Parse .npc files to extract NPC spawn data"""
+    npc_spawns = []
+    
+    npc_dir = Path(npc_dir)
+    if not npc_dir.exists():
+        return npc_spawns
+    
+    for npc_file in npc_dir.glob("*.npc"):
+        name = None
+        home_x = home_y = home_z = None
+        radius = 3
+        
+        with open(npc_file, 'r', encoding='latin-1', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                
+                if line.startswith('Name'):
+                    try:
+                        name = line.split('=', 1)[1].strip().strip('"')
+                    except:
+                        pass
+                elif line.startswith('Home'):
+                    try:
+                        coords = line.split('=')[1].strip().strip('[]')
+                        parts = coords.split(',')
+                        home_x = int(parts[0])
+                        home_y = int(parts[1])
+                        home_z = int(parts[2])
+                    except:
+                        pass
+                elif line.startswith('Radius'):
+                    try:
+                        radius = int(line.split('=')[1].strip())
+                    except:
+                        pass
+        
+        if name and home_x is not None:
+            npc_spawns.append({
+                'name': name,
+                'x': home_x,
+                'y': home_y,
+                'z': home_z,
+                'radius': radius
+            })
+    
+    return npc_spawns
+
+
+def generate_spawns_xml(monsters_db_path, creatures, npc_dir, output_path):
+    """Generate map-spawns.xml from monsters.db and .npc files"""
+    
+    print("\n" + "="*70)
+    print("GENERATING SPAWNS XML")
+    print("="*70)
+    
+    race_to_name = build_race_lookup(creatures)
+    print(f"Built race lookup: {len(race_to_name)} monsters")
+    
+    monster_spawns = parse_monsters_db(monsters_db_path)
+    print(f"Found {len(monster_spawns)} monster spawn entries")
+    
+    npc_spawns = parse_npc_files(npc_dir)
+    print(f"Found {len(npc_spawns)} NPC spawns")
+    
+    xml_lines = ['<?xml version="1.0"?>']
+    xml_lines.append('<spawns>')
+    
+    # Add monster spawns
+    for spawn in monster_spawns:
+        race = spawn['race']
+        monster_name = race_to_name.get(race)
+        
+        if not monster_name:
+            continue
+        
+        for i in range(spawn['amount']):
+            xml_lines.append(
+                f'\t<spawn centerx="{spawn["x"]}" centery="{spawn["y"]}" '
+                f'centerz="{spawn["z"]}" radius="{spawn["radius"]}">'
+                f'<monster name="{monster_name}" x="0" y="0" z="{spawn["z"]}" '
+                f'spawntime="{spawn["spawntime"]}"/></spawn>'
+            )
+    
+    # Add NPC spawns
+    for npc in npc_spawns:
+        xml_lines.append(
+            f'\t<spawn centerx="{npc["x"]}" centery="{npc["y"]}" '
+            f'centerz="{npc["z"]}" radius="{npc["radius"]}">'
+            f'<npc name="{npc["name"]}" x="0" y="0" z="{npc["z"]}" '
+            f'spawntime="60"/></spawn>'
+        )
+    
+    xml_lines.append('</spawns>')
+    
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(xml_lines))
+    
+    print(f"✓ Spawns XML generated: {len(monster_spawns)} monsters, {len(npc_spawns)} NPCs")
+
+
+# ============================================================================
+# Main workflow
 # ============================================================================
 def main():
+    if len(sys.argv) < 2:
+        print("Usage: python3 generate_rme_data.py <tibia-game-folder>")
+        print("\nExample:")
+        print("  python3 generate_rme_data.py ./tibia-game")
+        print("\nThis will generate:")
+        print("  output/rme_config/data/770/  (RME config files)")
+        print("  output/rme_config/clients_xml_snippet.txt")
+        sys.exit(1)
+    
+    tibia_game_dir = Path(sys.argv[1])
+    
+    dat_dir = tibia_game_dir / 'dat'
+    mon_dir = tibia_game_dir / 'mon'
+    objects_srv = dat_dir / 'objects.srv'
+    
+    if not tibia_game_dir.exists():
+        print(f"Error: {tibia_game_dir} not found!")
+        sys.exit(1)
+    
+    if not objects_srv.exists():
+        print(f"Error: {objects_srv} not found!")
+        sys.exit(1)
+    
     print("=" * 70)
     print("RME Data Generator for 7.70 CipSoft TypeIDs")
     print("=" * 70)
+    print(f"\nInput:  {tibia_game_dir.absolute()}")
     
-    # Paths
-    assets_dir = Path('assets')
-    objects_srv = assets_dir / 'objects.srv'
-    mon_dir = assets_dir / 'mon'
-    output_dir = Path('output/rme_config/data/770')
+    rme_config_dir = Path('output/rme_config/data/770')
+    rme_config_dir.mkdir(parents=True, exist_ok=True)
     
-    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Output: {rme_config_dir.absolute()}")
+    print("=" * 70)
     
     # Step 1: Parse objects.srv
     print("\n[1/5] Parsing objects.srv...")
     items = parse_objects_srv(objects_srv)
-    print(f"  ✓ Parsed {len(items)} items from objects.srv")
+    print(f"  ✓ Parsed {len(items)} items")
     
     # Step 2: Generate items.otb
     print("\n[2/5] Generating items.otb...")
-    item_count = generate_items_otb(items, output_dir / 'items.otb')
-    print(f"  ✓ Generated items.otb ({item_count} items)")
+    item_count = generate_items_otb(items, rme_config_dir / 'items.otb')
+    print(f"  ✓ Generated ({item_count} items)")
     
     # Step 3: Generate items.xml
     print("\n[3/5] Generating items.xml...")
-    xml_count = generate_items_xml(items, output_dir / 'items.xml')
-    print(f"  ✓ Generated items.xml ({xml_count} items)")
+    xml_count = generate_items_xml(items, rme_config_dir / 'items.xml')
+    print(f"  ✓ Generated ({xml_count} items)")
     
-    # Step 4: Generate creatures.xml from .mon files
+    # Step 4: Generate creatures.xml
     print("\n[4/5] Generating creatures.xml...")
     creatures = parse_mon_files(mon_dir)
     if creatures:
-        total = generate_creatures_xml(creatures, output_dir / 'creatures.xml')
-        print(f"  ✓ Generated creatures.xml ({total} creatures from .mon files)")
+        total = generate_creatures_xml(creatures, rme_config_dir / 'creatures.xml')
+        print(f"  ✓ Generated ({total} creatures)")
     else:
-        print(f"  ⚠ No .mon files found in {mon_dir}")
+        print(f"  ⚠ No .mon files found")
     
-    # Step 5: Generate palette XMLs and materials.xml
+    # Step 5: Generate palette XMLs
     print("\n[5/5] Generating palette XMLs...")
     
-    # Generate materials.xml (just includes)
     materials_xml = """<materials>
 	<include file="creature_palette.xml"/>
 	<include file="raw_palette.xml"/>
 </materials>
 """
-    with open(output_dir / 'materials.xml', 'w', encoding='utf-8') as f:
+    with open(rme_config_dir / 'materials.xml', 'w', encoding='utf-8') as f:
         f.write(materials_xml)
     print(f"  ✓ materials.xml")
     
-    # Generate creature_palette.xml (single category with all creatures)
     if creatures:
-        generate_creature_palette_xml(creatures, output_dir / 'creature_palette.xml')
-        print(f"  ✓ creature_palette.xml (1 tileset, {len(creatures)} creatures)")
+        generate_creature_palette_xml(creatures, rme_config_dir / 'creature_palette.xml')
+        print(f"  ✓ creature_palette.xml ({len(creatures)} creatures)")
     
-    # Generate raw_palette.xml (all items in one category)
-    generate_raw_palette_xml(items, output_dir / 'raw_palette.xml')
-    print(f"  ✓ raw_palette.xml (1 tileset, {len(items)} items)")
+    generate_raw_palette_xml(items, rme_config_dir / 'raw_palette.xml')
+    print(f"  ✓ raw_palette.xml ({len(items)} items)")
     
     # Generate clients.xml snippet
-    print("\n[6/6] Generating clients.xml snippet...")
     snippet = """<!-- Add this to RME/data/clients.xml -->
 
 <!-- In the <otbs> section, add: -->
@@ -524,13 +1148,13 @@ def main():
     print(f"  ✓ clients_xml_snippet.txt")
     
     print("\n" + "=" * 70)
-    print("✅ RME data generation complete!")
+    print("✅ RME Configuration Complete!")
     print("=" * 70)
-    print(f"\n📁 Output: {output_dir.absolute()}")
+    print(f"\nOutput: {rme_config_dir.absolute()}")
     print(f"\n📋 Next steps:")
-    print(f"   1. Copy {output_dir}/ to your RME installation")
-    print(f"   2. Add clients.xml snippet to RME/data/clients.xml")
-    print(f"   3. Copy Tibia.dat + Tibia.spr to RME client data path")
+    print(f"   1. Copy {rme_config_dir}/ to RME/data/770/")
+    print(f"   2. Add clients_xml_snippet.txt content to RME/data/clients.xml")
+    print(f"   3. Copy Tibia.dat + Tibia.spr to RME client data directory")
     print()
 
 
