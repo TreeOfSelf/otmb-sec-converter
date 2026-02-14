@@ -1,18 +1,48 @@
 #!/usr/bin/env python3
 """
-Generate RME data/ folder from CipSoft objects.srv for Tibia 7.7
-
-Creates:
-  - RME/data/770/items.otb (binary item database)
-  - RME/data/770/items.xml (metadata overrides)
+Complete RME data generator for 7.70 CipSoft TypeIDs
+Generates all necessary files from CipSoft game data + 760 reference XMLs
 """
-
+import os
 import struct
 from pathlib import Path
+from lxml import etree
 
 
+# ============================================================================
+# OTB/OTBM Constants
+# ============================================================================
+ITEM_ATTR_SERVERID = 0x10
+ITEM_ATTR_CLIENTID = 0x11
+ITEM_ATTR_NAME = 0x12
+ITEM_ATTR_SPEED = 0x14
+
+ITEM_GROUP_NONE = 0x00
+ITEM_GROUP_GROUND = 0x01
+ITEM_GROUP_CONTAINER = 0x02
+ITEM_GROUP_WEAPON = 0x03
+ITEM_GROUP_AMMUNITION = 0x04
+ITEM_GROUP_ARMOR = 0x05
+ITEM_GROUP_RUNE = 0x06
+ITEM_GROUP_TELEPORT = 0x07
+ITEM_GROUP_MAGICFIELD = 0x08
+ITEM_GROUP_WRITEABLE = 0x09
+ITEM_GROUP_KEY = 0x0A
+ITEM_GROUP_SPLASH = 0x0B
+ITEM_GROUP_FLUID = 0x0C
+ITEM_GROUP_DOOR = 0x0D
+ITEM_GROUP_DEPRECATED = 0x0E
+
+ESC_CHAR = 0xFD
+NODE_START = 0xFE
+NODE_END = 0xFF
+
+
+# ============================================================================
+# Step 1: Parse objects.srv for 770 items
+# ============================================================================
 def parse_objects_srv(objects_srv_path):
-    """Parse objects.srv and extract TypeID, Name, Flags, Attributes"""
+    """Parse CipSoft objects.srv to extract item definitions"""
     items = {}
     
     with open(objects_srv_path, 'r', encoding='latin-1', errors='ignore') as f:
@@ -22,422 +52,451 @@ def parse_objects_srv(objects_srv_path):
     while i < len(lines):
         line = lines[i].strip()
         
-        # Look for TypeID line
         if line.startswith('TypeID') and '=' in line:
             try:
                 type_id = int(line.split('=')[1].split('#')[0].strip())
-            except ValueError:
+            except:
                 i += 1
                 continue
             
-            # Parse item block (next ~20 lines)
-            item_data = {'type_id': type_id, 'name': '', 'flags': [], 'attributes': {}}
+            name = ""
+            flags = []
             
-            for j in range(i+1, min(i+30, len(lines))):
-                item_line = lines[j].strip()
+            # Read next lines for Name and Flags
+            i += 1
+            while i < len(lines):
+                line = lines[i].strip()
                 
-                # Stop at next TypeID
-                if item_line.startswith('TypeID'):
+                if line.startswith('TypeID'):
+                    i -= 1
                     break
                 
-                # Parse Name
-                if item_line.startswith('Name') and '=' in item_line:
-                    name = item_line.split('=', 1)[1].strip().strip('"')
-                    item_data['name'] = name
+                if line.startswith('Name') and '=' in line:
+                    name_part = line.split('=', 1)[1].strip()
+                    name = name_part.strip('"')
+                elif line.startswith('Flags') and '=' in line:
+                    flags_str = line.split('=', 1)[1].strip()
+                    flags_str = flags_str.strip('{}')
+                    flags = [f.strip() for f in flags_str.split(',') if f.strip()]
                 
-                # Parse Flags
-                if item_line.startswith('Flags') and '=' in item_line:
-                    flags_str = item_line.split('=', 1)[1].strip()
-                    if '{' in flags_str and '}' in flags_str:
-                        flags_str = flags_str.split('{')[1].split('}')[0]
-                        item_data['flags'] = [f.strip() for f in flags_str.split(',') if f.strip()]
-                
-                # Parse Attributes (Weight, Capacity, etc.)
-                if item_line.startswith('Attributes') and '=' in item_line:
-                    attrs_str = item_line.split('=', 1)[1].strip()
-                    if '{' in attrs_str and '}' in attrs_str:
-                        attrs_str = attrs_str.split('{')[1].split('}')[0]
-                        for attr in attrs_str.split(','):
-                            if '=' in attr:
-                                key, val = attr.split('=', 1)
-                                item_data['attributes'][key.strip()] = val.strip()
+                i += 1
+                if not line or line == '':
+                    break
             
-            items[type_id] = item_data
-        
-        i += 1
+            items[type_id] = {
+                'type_id': type_id,
+                'name': name,
+                'flags': flags
+            }
+        else:
+            i += 1
     
-    print(f"Parsed {len(items)} items from objects.srv")
     return items
 
 
-def write_otb_byte(data, b):
-    """Write byte with escape handling"""
-    ESC = 0xFD
-    INIT = 0xFE
-    TERM = 0xFF
-    
-    if b in (ESC, INIT, TERM):
-        data.append(ESC)
-    data.append(b)
-
-
-def write_otb_u16(data, val):
-    """Write uint16 LE with escape"""
-    write_otb_byte(data, val & 0xFF)
-    write_otb_byte(data, (val >> 8) & 0xFF)
-
-
-def write_otb_u32(data, val):
-    """Write uint32 LE with escape"""
-    write_otb_byte(data, val & 0xFF)
-    write_otb_byte(data, (val >> 8) & 0xFF)
-    write_otb_byte(data, (val >> 16) & 0xFF)
-    write_otb_byte(data, (val >> 24) & 0xFF)
-
-
-def write_otb_string(data, s):
-    """Write string with length prefix"""
-    encoded = s.encode('latin-1')
-    write_otb_u16(data, len(encoded))
-    for b in encoded:
-        write_otb_byte(data, b)
+# ============================================================================
+# Step 3: Generate items.otb with proper binary format
+# ============================================================================
+def escape_otb_data(data):
+    """Escape special bytes in OTB data"""
+    result = bytearray()
+    for byte in data:
+        if byte in [0xFD, 0xFE, 0xFF]:
+            result.append(0xFD)
+        result.append(byte)
+    return bytes(result)
 
 
 def generate_items_otb(items, output_path):
-    """Generate items.otb binary file from parsed objects.srv"""
+    """Generate items.otb in RME-compatible format"""
     data = bytearray()
     
-    # Header layout matching the 7.60-era OTB files
-    # (this is the layout that passes version checks in the target RME build)
-    data.extend([
-        0x00, 0x00, 0x00, 0x00,  # Magic
-        0xFE, 0x00,              # Root node start + type
-        0x00,                    # Type byte
-        0x00, 0x00, 0x00, 0x01,  # Flags/marker block used by this RME parser
-        0x8C, 0x00,              # Version data length (140 bytes)
-    ])
+    # Root node header
+    data.extend([0x00, 0x00, 0x00, 0x00])  # 4-byte null magic
+    data.append(0xFE)  # Node start
+    data.append(0x00)  # Node type (root)
+    data.append(0x00)  # Type byte
+    data.extend([0x00, 0x00, 0x00, 0x01])  # Flags (0x01 in 4th byte)
+    data.append(0x8C)  # Data length byte 1
+    data.append(0x00)  # Data length byte 2 (140 total)
     
-    # Bytes 13-152: Version data (4+4+4+128 = 140 bytes)
-    # Major version (OTB format version 1, matching official 7.70)
-    data.extend([0x01, 0x00, 0x00, 0x00])
-    # Minor version (OTB ID = 100 = 0x64)
-    data.extend([0x64, 0x00, 0x00, 0x00])
-    # Build number (1)
-    data.extend([0x01, 0x00, 0x00, 0x00])
+    # Version info (u32 fields)
+    data.extend(struct.pack('<I', 1))    # MajorVersion = 1
+    data.extend(struct.pack('<I', 100))  # MinorVersion = 100 (CipSoft 7.70)
+    data.extend(struct.pack('<I', 1))    # BuildNumber = 1
     
-    # CSD Version string (128 bytes, null-padded)
-    version_str = "OTB 1.0.0-7.70-cipsoft"
-    version_bytes = version_str.encode('latin-1')
-    data.extend(version_bytes)
-    # Pad to 128 bytes
-    data.extend([0x00] * (128 - len(version_bytes)))
+    # CSD version string (128 bytes)
+    csd = b'OTB 1.0.0-7.70-cipsoft\x00'
+    data.extend(csd + b'\x00' * (128 - len(csd)))
     
-    # Write items (only include items with non-empty names - IDs 0-99 are containers/internal)
+    # Generate item nodes (exclude items with empty names)
+    item_count = 0
     for type_id in sorted(items.keys()):
         item = items[type_id]
         
-        # Skip items with empty names (internal server containers, etc.)
+        # Skip items with empty names
         if not item['name']:
             continue
         
-        # Item node
-        # IMPORTANT: In this node format, the byte after NODE_START (0xFE) is the
-        # item "node type", and RME's loader reads that same byte as item group.
-        # So we must write FE + <group> directly (no extra type byte).
-        data.append(0xFE)  # Node start
-        
-        # Item group/type (this becomes the node type byte)
-        # Based on RME items.h enum ItemGroup_t:
-        # 0=NONE, 1=GROUND, 2=CONTAINER, 3=WEAPON, 4=AMMUNITION, 5=ARMOR, 6=RUNE, 7=TELEPORT,
-        # 8=MAGICFIELD, 9=WRITEABLE, 10=KEY, 11=SPLASH, 12=FLUID, 13=DOOR
+        # Determine item group
         flags = item['flags']
-        if 'Bank' in flags:  # Bank = ground layer item in CipSoft objects.srv
-            item_group = 0x01  # ITEM_GROUP_GROUND
+        if 'Bank' in flags:
+            item_group = ITEM_GROUP_GROUND
         elif 'Container' in flags:
-            item_group = 0x02  # ITEM_GROUP_CONTAINER
-        elif 'Splash' in flags or 'FluidContainer' in flags or 'LiquidContainer' in flags:
-            item_group = 0x0B  # ITEM_GROUP_SPLASH
-        elif 'Rune' in flags:
-            item_group = 0x06  # ITEM_GROUP_RUNE
+            item_group = ITEM_GROUP_CONTAINER
+        elif 'Splash' in flags:
+            item_group = ITEM_GROUP_SPLASH
+        elif 'Rune' in flags or 'MagicEffect' in flags:
+            item_group = ITEM_GROUP_RUNE
         else:
-            item_group = 0x00  # ITEM_GROUP_NONE (normal item)
+            item_group = ITEM_GROUP_NONE
         
-        data.append(item_group)  # Node type / item group byte
-
-        # Flags (u32)
-        # RME's OTB v1 loader (`loadFromOtbVer1`) will always attempt to read a u32 flags block
-        # right after the group byte. If we don't include it, the loader will consume our
-        # first attribute bytes as flags and desync the entire file.
-        #
-        # We keep this conservative (0) for now; attributes are what we strictly need for RME
-        # to map serverid/clientid/name correctly.
-        write_otb_u32(data, 0)
+        # Build item node
+        item_data = bytearray()
         
-        # Attributes
-        # Format: [attribute_type] [u16 data_length] [data...]
-        # NOTE: Attribute TYPE bytes are NOT escaped, but length and data ARE escaped
+        # Flags (4 bytes, all zeros)
+        item_data.extend([0x00, 0x00, 0x00, 0x00])
         
-        # 0x10: Server ID
-        data.append(0x10)  # Attribute type (raw)
-        write_otb_u16(data, 2)  # Data length = 2 bytes
-        write_otb_u16(data, type_id)  # Server ID
+        # ServerID attribute
+        item_data.append(ITEM_ATTR_SERVERID)
+        item_data.extend(struct.pack('<H', 2))  # length
+        item_data.extend(struct.pack('<H', type_id))
         
-        # 0x11: Client ID
-        data.append(0x11)  # Attribute type (raw)
-        write_otb_u16(data, 2)  # Data length = 2 bytes
-        write_otb_u16(data, type_id)  # Client ID
+        # ClientID attribute (same as ServerID in CipSoft mode)
+        item_data.append(ITEM_ATTR_CLIENTID)
+        item_data.extend(struct.pack('<H', 2))  # length
+        item_data.extend(struct.pack('<H', type_id))
         
-        # 0x12: Name
-        if item['name']:
-            name_bytes = item['name'].encode('latin-1')
-            data.append(0x12)  # Attribute type (raw)
-            write_otb_u16(data, len(name_bytes))  # Data length
-            # Write name bytes with node-file escaping (length is the *unescaped* length)
-            for b in name_bytes:
-                write_otb_byte(data, b)
+        # Name attribute
+        name_bytes = item['name'].encode('latin-1', errors='ignore')
+        item_data.append(ITEM_ATTR_NAME)
+        item_data.extend(struct.pack('<H', len(name_bytes)))
+        item_data.extend(name_bytes)
         
-        # 0x14: Speed (for ground items)
-        if item_group == 0x01:  # ITEM_GROUP_GROUND
-            data.append(0x14)  # Attribute type (raw)
-            write_otb_u16(data, 2)  # Data length = 2 bytes
-            write_otb_u16(data, 150)  # Speed value
+        # Speed attribute for ground items
+        if item_group == ITEM_GROUP_GROUND:
+            item_data.append(ITEM_ATTR_SPEED)
+            item_data.extend(struct.pack('<H', 2))  # length
+            item_data.extend(struct.pack('<H', 150))  # speed value
         
-        # End item node (raw 0xFF)
-        data.append(0xFF)
+        # Escape and write item node
+        escaped = escape_otb_data(item_data)
+        data.append(NODE_START)
+        data.append(item_group)
+        data.extend(escaped)
+        data.append(NODE_END)
+        
+        item_count += 1
     
     # End root node
-    data.append(0xFF)
+    data.append(NODE_END)
     
-    # Write to file
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, 'wb') as f:
         f.write(data)
     
-    print(f"Generated {output_path} ({len(data)} bytes, {len(items)} items)")
+    return item_count
 
 
+# ============================================================================
+# Step 4: Generate items.xml
+# ============================================================================
 def generate_items_xml(items, output_path):
-    """Generate items.xml with ALL items + RME-specific metadata"""
-    xml_lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<items>']
-    
-    doors = []
-    depots = []
-    special = []
+    """Generate items.xml for RME"""
+    root = etree.Element('items')
     
     for type_id in sorted(items.keys()):
         item = items[type_id]
+        
+        # Skip ID 0 (RME rejects it) and empty names
+        if type_id == 0 or not item['name']:
+            continue
+        
+        item_elem = etree.SubElement(root, 'item')
+        item_elem.set('id', str(type_id))
+        item_elem.set('name', item['name'])
+        
+        # Add article if name starts with "a " or "an "
+        name_lower = item['name'].lower()
+        if name_lower.startswith('a '):
+            item_elem.set('article', 'a')
+            item_elem.set('name', item['name'][2:])
+        elif name_lower.startswith('an '):
+            item_elem.set('article', 'an')
+            item_elem.set('name', item['name'][3:])
+        
+        # Add type attributes based on flags
         flags = item['flags']
-        name = item['name']
-        attrs_dict = item['attributes']
-        
-        # Skip ID 0 - RME rejects it in items.xml (line 1047: if fromId == 0...)
-        if type_id == 0:
-            continue
-        
-        # Parse article
-        article = None
-        name_clean = name
-        if name.startswith('a '):
-            article = 'a'
-            name_clean = name[2:]
-        elif name.startswith('an '):
-            article = 'an'
-            name_clean = name[3:]
-        
-        # Detect doors
-        is_door = ('KeyDoor' in flags or 'NameDoor' in flags or 
-                   ('ChangeUse' in flags and 'door' in name.lower()))
-        
-        # Detect depots
-        is_depot = 'locker' in name.lower()
-        
-        # Collect attributes to determine if item needs opening/closing tags
-        item_attrs = []
-        
-        # Door attributes
-        if is_door:
-            item_attrs.append(('type', 'door'))
-            if 'Unthrow' in flags or 'Unlay' in flags:
-                item_attrs.append(('blockprojectile', '1'))
-            doors.append(type_id)
-        
-        # Depot attributes
-        elif is_depot:
-            capacity = attrs_dict.get('Capacity', '30')
-            item_attrs.append(('type', 'depot'))
-            item_attrs.append(('containerSize', capacity))
-            depots.append(type_id)
-        
-        # Container attributes
-        if 'Container' in flags and 'Capacity' in attrs_dict:
-            item_attrs.append(('containerSize', attrs_dict['Capacity']))
-        
-        # Weight
-        if 'Weight' in attrs_dict:
-            item_attrs.append(('weight', attrs_dict['Weight']))
-        
-        # Build item entry (single line if no attributes, multi-line if has attributes)
-        if article:
-            base_attrs = f'id="{type_id}" article="{article}" name="{name_clean}"'
-        else:
-            base_attrs = f'id="{type_id}" name="{name_clean}"'
-        
-        if item_attrs:
-            # Multi-line item with attributes
-            xml_lines.append(f'\t<item {base_attrs}>')
-            for key, value in item_attrs:
-                xml_lines.append(f'\t\t<attribute key="{key}" value="{value}"/>')
-            xml_lines.append('\t</item>')
-            special.append(type_id)
-        else:
-            # Single-line item with no attributes
-            xml_lines.append(f'\t<item {base_attrs}/>')
+        if 'Key' in flags:
+            item_elem.set('type', 'key')
+        elif 'Container' in flags:
+            item_elem.set('type', 'container')
+        elif 'Splash' in flags or 'LiquidContainer' in flags or 'LiquidSource' in flags:
+            item_elem.set('type', 'splash')
+        elif 'Teleport' in flags:
+            item_elem.set('type', 'teleport')
+        elif 'Door' in flags or 'Hatch' in flags or 'Gate' in flags:
+            item_elem.set('type', 'door')
+        elif 'Depot' in flags:
+            item_elem.set('type', 'depot')
     
-    xml_lines.append('</items>')
+    tree = etree.ElementTree(root)
+    tree.write(output_path, encoding='utf-8', xml_declaration=True, pretty_print=True)
     
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(xml_lines))
-    
-    print(f"Generated {output_path} ({len(items)} items: {len(doors)} doors, {len(depots)} depots)")
+    return len(root)
 
 
-def get_dat_spr_signatures():
-    """Extract signatures from Tibia.dat/Tibia.spr"""
-    import struct
-    
-    try:
-        dat = Path('assets/Tibia.dat').read_bytes()
-        spr = Path('assets/Tibia.spr').read_bytes()
-        
-        dat_sig = struct.unpack('<I', dat[0:4])[0]
-        spr_sig = struct.unpack('<I', spr[0:4])[0]
-        
-        return f'0x{dat_sig:08X}', f'0x{spr_sig:08X}'
-    except:
-        return '0x439D5A33', '0x439852BE'  # Fallback
-
-
-def generate_materials_xml(output_path):
-    """Generate minimal materials.xml for RME"""
-    xml_content = '''<materials>
-	<!-- Metaitems for 7.70 CipSoft -->
-	<metaitem id="80"/>
-	<metaitem id="81"/>
-	<metaitem id="82"/>
-	<metaitem id="83"/>
-	<metaitem id="84"/>
-	<metaitem id="85"/>
-	<metaitem id="86"/>
-	<metaitem id="87"/>
-	<metaitem id="88"/>
-	<metaitem id="89"/>
-</materials>
-'''
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, 'w') as f:
-        f.write(xml_content)
-    print(f"Generated {output_path}")
-
-
+# ============================================================================
+# Step 5: Parse .mon files and generate creatures.xml
+# ============================================================================
 def parse_mon_files(mon_dir):
-    """Parse all .mon files to extract creature data"""
-    import re
+    """Parse .mon files to extract creature definitions using FILENAME as name"""
+    creatures = {}
     
-    creatures = []
-    mon_files = sorted(Path(mon_dir).glob('*.mon'))
+    # Convert to Path if needed
+    if isinstance(mon_dir, str):
+        mon_dir = Path(mon_dir)
     
-    for mon_file in mon_files:
-        try:
-            content = mon_file.read_text(encoding='latin-1', errors='ignore')
-            
-            race_num = None
-            name = None
-            outfit = None
-            
-            for line in content.split('\n'):
-                line = line.strip()
-                
-                if line.startswith('RaceNumber'):
-                    match = re.search(r'=\s*(\d+)', line)
-                    if match:
-                        race_num = int(match.group(1))
-                
-                elif line.startswith('Name'):
-                    match = re.search(r'=\s*"([^"]+)"', line)
-                    if match:
-                        name = match.group(1)
-                
-                elif line.startswith('Outfit'):
-                    match = re.search(r'\((\d+),\s*(\d+)-(\d+)-(\d+)-(\d+)\)', line)
-                    if match:
-                        outfit = {
-                            'looktype': int(match.group(1)),
-                            'head': int(match.group(2)),
-                            'body': int(match.group(3)),
-                            'legs': int(match.group(4)),
-                            'feet': int(match.group(5))
-                        }
-            
-            if race_num and name and outfit:
-                creatures.append({
-                    'race': race_num,
-                    'name': name,
-                    'outfit': outfit
-                })
-        
-        except Exception:
+    if not mon_dir.exists():
+        return creatures
+    
+    for filename in os.listdir(str(mon_dir)):
+        if not filename.endswith('.mon'):
             continue
+        
+        filepath = mon_dir / filename
+        
+        # Use filename (without .mon) as the creature name
+        creature_name = filename.replace('.mon', '')
+        
+        with open(filepath, 'r', encoding='latin-1', errors='ignore') as f:
+            lines = f.readlines()
+        
+        race_number = None
+        looktype = None
+        lookhead = lookbody = looklegs = lookfeet = 0
+        
+        for line in lines:
+            line = line.strip()
+            
+            if line.startswith('RaceNumber') and '=' in line:
+                try:
+                    race_number = int(line.split('=')[1].split('#')[0].strip())
+                except:
+                    pass
+            elif line.startswith('Outfit') and '=' in line:
+                outfit_str = line.split('=', 1)[1].strip().strip('()')
+                try:
+                    # Format: (118, 0-0-0-0) or (118,0-0-0-0)
+                    parts = outfit_str.split(',', 1)
+                    looktype = int(parts[0].strip()) if len(parts) > 0 else None
+                    if len(parts) > 1:
+                        colors = parts[1].strip().split('-')
+                        lookhead = int(colors[0]) if len(colors) > 0 else 0
+                        lookbody = int(colors[1]) if len(colors) > 1 else 0
+                        looklegs = int(colors[2]) if len(colors) > 2 else 0
+                        lookfeet = int(colors[3]) if len(colors) > 3 else 0
+                except:
+                    pass
+        
+        if looktype:
+            creatures[creature_name] = {
+                'name': creature_name,
+                'looktype': looktype,
+                'lookhead': lookhead,
+                'lookbody': lookbody,
+                'looklegs': looklegs,
+                'lookfeet': lookfeet
+            }
     
     return creatures
 
 
-def generate_creatures_xml(mon_dir, output_path):
-    """Generate creatures.xml from .mon files"""
-    creatures = parse_mon_files(mon_dir)
+def generate_creatures_xml(creatures, output_path):
+    """
+    Generate creatures.xml directly from .mon files (no merging)
+    Uses filename as creature name to avoid collisions
+    """
+    all_creatures = []
     
-    # Sort by name
-    creatures.sort(key=lambda c: c['name'].lower())
+    # Add all creatures from .mon files
+    for creature_name, creature in creatures.items():
+        c = {
+            'name': creature['name'],
+            'type': 'monster',
+            'looktype': str(creature['looktype']),
+            'lookhead': str(creature['lookhead']) if creature['lookhead'] else None,
+            'lookbody': str(creature['lookbody']) if creature['lookbody'] else None,
+            'looklegs': str(creature['looklegs']) if creature['looklegs'] else None,
+            'lookfeet': str(creature['lookfeet']) if creature['lookfeet'] else None,
+        }
+        all_creatures.append(c)
     
-    xml_lines = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        '<creatures>',
-        '\t<!-- this file is for indexing only -->',
-        '\t<!-- for sorting see creature_palette.xml -->'
-    ]
+    # Sort all creatures by name
+    all_creatures.sort(key=lambda x: x['name'].lower())
     
-    for creature in creatures:
-        name = creature['name']
-        looktype = creature['outfit']['looktype']
-        head = creature['outfit']['head']
-        body = creature['outfit']['body']
-        legs = creature['outfit']['legs']
-        feet = creature['outfit']['feet']
+    # Build new tree with proper formatting
+    root = etree.Element('creatures')
+    root.text = '\n\t'  # Newline + tab after opening tag
+    
+    comment1 = etree.Comment(' this file is for indexing only ')
+    comment1.tail = '\n\t'
+    root.append(comment1)
+    
+    comment2 = etree.Comment(' for sorting see creature_palette.xml ')
+    comment2.tail = '\n\t'
+    root.append(comment2)
+    
+    for i, c in enumerate(all_creatures):
+        creature_elem = etree.Element('creature')
+        creature_elem.set('name', c['name'])
+        creature_elem.set('type', c['type'])
         
-        # If all colors are 0, don't include them
-        if head == 0 and body == 0 and legs == 0 and feet == 0:
-            xml_lines.append(f'\t<creature name="{name}" type="monster" looktype="{looktype}"/>')
+        # Only set looktype if it exists
+        if c['looktype']:
+            creature_elem.set('looktype', c['looktype'])
+        
+        # Add optional color attributes
+        if c['lookhead']:
+            creature_elem.set('lookhead', c['lookhead'])
+        if c['lookbody']:
+            creature_elem.set('lookbody', c['lookbody'])
+        if c['looklegs']:
+            creature_elem.set('looklegs', c['looklegs'])
+        if c['lookfeet']:
+            creature_elem.set('lookfeet', c['lookfeet'])
+        
+        # Set tail for proper indentation
+        if i < len(all_creatures) - 1:
+            creature_elem.tail = '\n\t'
         else:
-            xml_lines.append(
-                f'\t<creature name="{name}" type="monster" '
-                f'looktype="{looktype}" lookhead="{head}" lookbody="{body}" '
-                f'looklegs="{legs}" lookfeet="{feet}"/>'
-            )
+            creature_elem.tail = '\n'  # Last element
+        
+        root.append(creature_elem)
     
-    xml_lines.append('</creatures>')
+    tree = etree.ElementTree(root)
+    tree.write(output_path, encoding='utf-8', xml_declaration=True)
     
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(xml_lines))
-    
-    print(f"Generated {output_path} ({len(creatures)} creatures)")
+    return len(all_creatures)
 
 
-def generate_clients_xml_snippet(output_dir):
-    """Generate clients.xml snippet to manually add to RME"""
-    dat_sig, spr_sig = get_dat_spr_signatures()
+def generate_creature_palette_xml(creatures, output_path):
+    """Generate creature_palette.xml with single category"""
+    root = etree.Element('materialsextension')
+    root.text = '\n\t'
     
-    snippet = f'''<!-- Add this to RME/data/clients.xml -->
+    # Single tileset called "Creatures"
+    tileset = etree.SubElement(root, 'tileset', name='Creatures')
+    tileset.text = '\n\t\t'
+    tileset.tail = '\n'
+    
+    # Add all creatures sorted by name
+    creature_list = sorted(creatures.items(), key=lambda x: x[1]['name'].lower())
+    
+    for i, (creature_name, creature) in enumerate(creature_list):
+        creature_elem = etree.SubElement(tileset, 'creature', name=creature['name'])
+        
+        # Set tail for proper formatting
+        if i < len(creature_list) - 1:
+            creature_elem.tail = '\n\t\t'
+        else:
+            creature_elem.tail = '\n\t'
+    
+    tree = etree.ElementTree(root)
+    tree.write(output_path, encoding='utf-8', xml_declaration=True)
+
+
+def generate_raw_palette_xml(items, output_path):
+    """Generate raw_palette.xml with all items in one category"""
+    root = etree.Element('materialsextension')
+    root.text = '\n\t'
+    
+    # Single tileset called "Items"
+    tileset = etree.SubElement(root, 'tileset', name='Items')
+    tileset.text = '\n\t\t'
+    tileset.tail = '\n'
+    
+    # Add all items sorted by ID
+    item_list = [(type_id, item) for type_id, item in items.items() if item['name']]
+    item_list.sort(key=lambda x: x[0])
+    
+    for i, (type_id, item) in enumerate(item_list):
+        item_elem = etree.SubElement(tileset, 'item', id=str(type_id))
+        
+        # Set tail for proper formatting
+        if i < len(item_list) - 1:
+            item_elem.tail = '\n\t\t'
+        else:
+            item_elem.tail = '\n\t'
+    
+    tree = etree.ElementTree(root)
+    tree.write(output_path, encoding='utf-8', xml_declaration=True)
+
+
+# ============================================================================
+# Main generation workflow
+# ============================================================================
+def main():
+    print("=" * 70)
+    print("RME Data Generator for 7.70 CipSoft TypeIDs")
+    print("=" * 70)
+    
+    # Paths
+    assets_dir = Path('assets')
+    objects_srv = assets_dir / 'objects.srv'
+    mon_dir = assets_dir / 'mon'
+    output_dir = Path('output/rme_config/data/770')
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Step 1: Parse objects.srv
+    print("\n[1/5] Parsing objects.srv...")
+    items = parse_objects_srv(objects_srv)
+    print(f"  ✓ Parsed {len(items)} items from objects.srv")
+    
+    # Step 2: Generate items.otb
+    print("\n[2/5] Generating items.otb...")
+    item_count = generate_items_otb(items, output_dir / 'items.otb')
+    print(f"  ✓ Generated items.otb ({item_count} items)")
+    
+    # Step 3: Generate items.xml
+    print("\n[3/5] Generating items.xml...")
+    xml_count = generate_items_xml(items, output_dir / 'items.xml')
+    print(f"  ✓ Generated items.xml ({xml_count} items)")
+    
+    # Step 4: Generate creatures.xml from .mon files
+    print("\n[4/5] Generating creatures.xml...")
+    creatures = parse_mon_files(mon_dir)
+    if creatures:
+        total = generate_creatures_xml(creatures, output_dir / 'creatures.xml')
+        print(f"  ✓ Generated creatures.xml ({total} creatures from .mon files)")
+    else:
+        print(f"  ⚠ No .mon files found in {mon_dir}")
+    
+    # Step 5: Generate palette XMLs and materials.xml
+    print("\n[5/5] Generating palette XMLs...")
+    
+    # Generate materials.xml (just includes)
+    materials_xml = """<materials>
+	<include file="creature_palette.xml"/>
+	<include file="raw_palette.xml"/>
+</materials>
+"""
+    with open(output_dir / 'materials.xml', 'w', encoding='utf-8') as f:
+        f.write(materials_xml)
+    print(f"  ✓ materials.xml")
+    
+    # Generate creature_palette.xml (single category with all creatures)
+    if creatures:
+        generate_creature_palette_xml(creatures, output_dir / 'creature_palette.xml')
+        print(f"  ✓ creature_palette.xml (1 tileset, {len(creatures)} creatures)")
+    
+    # Generate raw_palette.xml (all items in one category)
+    generate_raw_palette_xml(items, output_dir / 'raw_palette.xml')
+    print(f"  ✓ raw_palette.xml (1 tileset, {len(items)} items)")
+    
+    # Generate clients.xml snippet
+    print("\n[6/6] Generating clients.xml snippet...")
+    snippet = """<!-- Add this to RME/data/clients.xml -->
 
 <!-- In the <otbs> section, add: -->
 <otb client="7.70-cipsoft" version="1" id="100"/>
@@ -446,53 +505,23 @@ def generate_clients_xml_snippet(output_dir):
 <client name="7.70 (CipSoft)" otb="7.70-cipsoft" visible="true" data_directory="770">
     <otbm version="1"/>
     <extensions from="7.6" to="7.6"/>
-    <data format="7.55" dat="{dat_sig}" spr="{spr_sig}"/>
+    <data format="7.55" dat="0x439D5A33" spr="0x439852BE"/>
 </client>
-'''
+"""
     
-    snippet_path = output_dir / 'clients_xml_snippet.txt'
-    with open(snippet_path, 'w') as f:
+    with open('output/rme_config/clients_xml_snippet.txt', 'w') as f:
         f.write(snippet)
+    print(f"  ✓ clients_xml_snippet.txt")
     
-    print(f"Generated {snippet_path}")
-
-
-def main():
-    # Paths
-    objects_srv = Path('assets/objects.srv')
-    mon_dir = Path('assets/mon')
-    output_base = Path('output/rme_config')
-    data_dir = output_base / 'data' / '770'
-    
-    if not objects_srv.exists():
-        print(f"Error: {objects_srv} not found")
-        return
-    
-    print(f"Generating RME config from {objects_srv}...")
+    print("\n" + "=" * 70)
+    print("✅ RME data generation complete!")
+    print("=" * 70)
+    print(f"\n📁 Output: {output_dir.absolute()}")
+    print(f"\n📋 Next steps:")
+    print(f"   1. Copy {output_dir}/ to your RME installation")
+    print(f"   2. Add clients.xml snippet to RME/data/clients.xml")
+    print(f"   3. Copy Tibia.dat + Tibia.spr to RME client data path")
     print()
-    
-    # Parse objects.srv
-    items = parse_objects_srv(objects_srv)
-    
-    # Generate files
-    generate_items_otb(items, data_dir / 'items.otb')
-    generate_items_xml(items, data_dir / 'items.xml')
-    generate_materials_xml(data_dir / 'materials.xml')
-    
-    # Generate creatures.xml if .mon files exist
-    if mon_dir.exists():
-        generate_creatures_xml(mon_dir, data_dir / 'creatures.xml')
-    
-    generate_clients_xml_snippet(output_base)
-    
-    print()
-    print(f"✅ Generated RME config in {output_base}/")
-    print()
-    print("📋 Manual steps:")
-    print(f"   1. Copy {data_dir}/ → RME/data/770/")
-    print(f"   2. Add snippet from clients_xml_snippet.txt to RME/data/clients.xml")
-    print(f"   3. Update sec_to_otbm.py to write OTB ID 100 in header")
-    print(f"   4. Copy assets/Tibia.dat + Tibia.spr to RME client data path")
 
 
 if __name__ == '__main__':
