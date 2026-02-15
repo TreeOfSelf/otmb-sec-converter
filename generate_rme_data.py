@@ -379,8 +379,8 @@ def parse_mon_files(mon_dir):
     return creatures
 
 
-def generate_creatures_xml(creatures, output_path):
-    """Generate creatures.xml directly from .mon files"""
+def generate_creatures_xml(creatures, npc_creatures, output_path):
+    """Generate creatures.xml directly from .mon files and .npc files"""
     all_creatures = []
     
     # Add all creatures from .mon files
@@ -393,6 +393,19 @@ def generate_creatures_xml(creatures, output_path):
             'lookbody': str(creature['lookbody']) if creature['lookbody'] else None,
             'looklegs': str(creature['looklegs']) if creature['looklegs'] else None,
             'lookfeet': str(creature['lookfeet']) if creature['lookfeet'] else None,
+        }
+        all_creatures.append(c)
+    
+    # Add all NPCs from .npc files
+    for npc_name, npc in npc_creatures.items():
+        c = {
+            'name': npc['name'],
+            'type': 'npc',
+            'looktype': str(npc['looktype']),
+            'lookhead': str(npc['lookhead']) if npc['lookhead'] else None,
+            'lookbody': str(npc['lookbody']) if npc['lookbody'] else None,
+            'looklegs': str(npc['looklegs']) if npc['looklegs'] else None,
+            'lookfeet': str(npc['lookfeet']) if npc['lookfeet'] else None,
         }
         all_creatures.append(c)
     
@@ -439,61 +452,6 @@ def generate_creatures_xml(creatures, output_path):
     tree.write(output_path, encoding='utf-8', xml_declaration=True)
     
     return len(all_creatures)
-
-
-def generate_creature_palette_xml(creatures, output_path):
-    """Generate creature_palette.xml with single category"""
-    root = etree.Element('materials')
-    root.text = '\n\t'
-    
-    tileset = etree.SubElement(root, 'tileset', name='Creatures')
-    tileset.text = '\n\t\t'
-    tileset.tail = '\n'
-    
-    creatures_wrapper = etree.SubElement(tileset, 'creatures')
-    creatures_wrapper.text = '\n\t\t\t'
-    creatures_wrapper.tail = '\n\t'
-    
-    creature_list = sorted(creatures.items(), key=lambda x: x[1]['name'].lower())
-    
-    for i, (creature_name, creature) in enumerate(creature_list):
-        creature_elem = etree.SubElement(creatures_wrapper, 'creature', name=creature['name'])
-        
-        if i < len(creature_list) - 1:
-            creature_elem.tail = '\n\t\t\t'
-        else:
-            creature_elem.tail = '\n\t\t'
-    
-    tree = etree.ElementTree(root)
-    tree.write(output_path, encoding='utf-8', xml_declaration=True)
-
-
-def generate_raw_palette_xml(items, output_path):
-    """Generate raw_palette.xml with all items in one category"""
-    root = etree.Element('materials')
-    root.text = '\n\t'
-    
-    tileset = etree.SubElement(root, 'tileset', name='Items')
-    tileset.text = '\n\t\t'
-    tileset.tail = '\n'
-    
-    raw_wrapper = etree.SubElement(tileset, 'raw')
-    raw_wrapper.text = '\n\t\t\t'
-    raw_wrapper.tail = '\n\t'
-    
-    item_list = [(type_id, item) for type_id, item in items.items() if item['name']]
-    item_list.sort(key=lambda x: x[0])
-    
-    for i, (type_id, item) in enumerate(item_list):
-        item_elem = etree.SubElement(raw_wrapper, 'item', id=str(type_id))
-        
-        if i < len(item_list) - 1:
-            item_elem.tail = '\n\t\t\t'
-        else:
-            item_elem.tail = '\n\t\t'
-    
-    tree = etree.ElementTree(root)
-    tree.write(output_path, encoding='utf-8', xml_declaration=True)
 
 
 # ============================================================================
@@ -947,28 +905,34 @@ def parse_monsters_db(monsters_db_path):
 
 
 def parse_npc_files(npc_dir):
-    """Parse .npc files to extract NPC spawn data"""
+    """Parse .npc files to extract NPC spawn data and outfit info (using Name field)"""
     npc_spawns = []
+    npc_creatures = {}  # For creatures.xml generation
     
     npc_dir = Path(npc_dir)
     if not npc_dir.exists():
-        return npc_spawns
+        return npc_spawns, npc_creatures
     
     for npc_file in npc_dir.glob("*.npc"):
-        name = None
+        npc_filename = npc_file.stem
+        
+        display_name = None  # Name field - used to avoid .mon filename conflicts
         home_x = home_y = home_z = None
         radius = 3
+        looktype = None
+        lookhead = lookbody = looklegs = lookfeet = 0
         
         with open(npc_file, 'r', encoding='latin-1', errors='ignore') as f:
             for line in f:
                 line = line.strip()
                 
-                if line.startswith('Name'):
+                # Parse Name field (e.g., "A Wrinkled Beholder")
+                if line.startswith('Name') and '=' in line:
                     try:
-                        name = line.split('=', 1)[1].strip().strip('"')
+                        display_name = line.split('=', 1)[1].strip().strip('"')
                     except:
                         pass
-                elif line.startswith('Home'):
+                elif line.startswith('Home') and '=' in line:
                     try:
                         coords = line.split('=')[1].strip().strip('[]')
                         parts = coords.split(',')
@@ -977,22 +941,52 @@ def parse_npc_files(npc_dir):
                         home_z = int(parts[2])
                     except:
                         pass
-                elif line.startswith('Radius'):
+                elif line.startswith('Radius') and '=' in line:
                     try:
                         radius = int(line.split('=')[1].strip())
                     except:
                         pass
+                elif line.startswith('Outfit') and '=' in line:
+                    outfit_str = line.split('=', 1)[1].strip().strip('()')
+                    try:
+                        # Format: (looktype, head-body-legs-feet)
+                        parts = outfit_str.split(',', 1)
+                        looktype = int(parts[0].strip()) if len(parts) > 0 else None
+                        if len(parts) > 1:
+                            colors = parts[1].strip().split('-')
+                            lookhead = int(colors[0]) if len(colors) > 0 else 0
+                            lookbody = int(colors[1]) if len(colors) > 1 else 0
+                            looklegs = int(colors[2]) if len(colors) > 2 else 0
+                            lookfeet = int(colors[3]) if len(colors) > 3 else 0
+                    except:
+                        pass
         
-        if name and home_x is not None:
+        # Use display_name (from Name field) to avoid .mon conflicts
+        if not display_name:
+            display_name = npc_filename  # Fallback to filename if no Name field
+        
+        # Add to spawn list if has position
+        if home_x is not None:
             npc_spawns.append({
-                'name': name,
+                'name': display_name,
                 'x': home_x,
                 'y': home_y,
                 'z': home_z,
                 'radius': radius
             })
+        
+        # Add to creatures dict if has outfit
+        if looktype:
+            npc_creatures[display_name] = {
+                'name': display_name,
+                'looktype': looktype,
+                'lookhead': lookhead,
+                'lookbody': lookbody,
+                'looklegs': looklegs,
+                'lookfeet': lookfeet
+            }
     
-    return npc_spawns
+    return npc_spawns, npc_creatures
 
 
 def generate_spawns_xml(monsters_db_path, creatures, npc_dir, output_path):
@@ -1008,7 +1002,7 @@ def generate_spawns_xml(monsters_db_path, creatures, npc_dir, output_path):
     monster_spawns = parse_monsters_db(monsters_db_path)
     print(f"Found {len(monster_spawns)} monster spawn entries")
     
-    npc_spawns = parse_npc_files(npc_dir)
+    npc_spawns, npc_creatures = parse_npc_files(npc_dir)
     print(f"Found {len(npc_spawns)} NPC spawns")
     
     xml_lines = ['<?xml version="1.0"?>']
@@ -1087,47 +1081,36 @@ def main():
     print("=" * 70)
     
     # Step 1: Parse objects.srv
-    print("\n[1/5] Parsing objects.srv...")
+    print("\n[1/4] Parsing objects.srv...")
     items = parse_objects_srv(objects_srv)
     print(f"  ✓ Parsed {len(items)} items")
     
     # Step 2: Generate items.otb
-    print("\n[2/5] Generating items.otb...")
+    print("\n[2/4] Generating items.otb...")
     item_count = generate_items_otb(items, rme_config_dir / 'items.otb')
     print(f"  ✓ Generated ({item_count} items)")
     
     # Step 3: Generate items.xml
-    print("\n[3/5] Generating items.xml...")
+    print("\n[3/4] Generating items.xml...")
     xml_count = generate_items_xml(items, rme_config_dir / 'items.xml')
     print(f"  ✓ Generated ({xml_count} items)")
     
     # Step 4: Generate creatures.xml
-    print("\n[4/5] Generating creatures.xml...")
+    print("\n[4/4] Generating creatures.xml...")
     creatures = parse_mon_files(mon_dir)
-    if creatures:
-        total = generate_creatures_xml(creatures, rme_config_dir / 'creatures.xml')
-        print(f"  ✓ Generated ({total} creatures)")
+    npc_dir = tibia_game_dir / 'npc'
+    _, npc_creatures = parse_npc_files(npc_dir)
+    
+    if creatures or npc_creatures:
+        total = generate_creatures_xml(creatures, npc_creatures, rme_config_dir / 'creatures.xml')
+        print(f"  ✓ Generated ({total} creatures: {len(creatures)} monsters, {len(npc_creatures)} NPCs)")
     else:
-        print(f"  ⚠ No .mon files found")
+        print(f"  ⚠ No .mon or .npc files found")
     
-    # Step 5: Generate palette XMLs
-    print("\n[5/5] Generating palette XMLs...")
-    
-    materials_xml = """<materials>
-	<include file="creature_palette.xml"/>
-	<include file="raw_palette.xml"/>
-</materials>
-"""
+    # Write empty materials.xml (RME expects it to exist)
     with open(rme_config_dir / 'materials.xml', 'w', encoding='utf-8') as f:
-        f.write(materials_xml)
-    print(f"  ✓ materials.xml")
-    
-    if creatures:
-        generate_creature_palette_xml(creatures, rme_config_dir / 'creature_palette.xml')
-        print(f"  ✓ creature_palette.xml ({len(creatures)} creatures)")
-    
-    generate_raw_palette_xml(items, rme_config_dir / 'raw_palette.xml')
-    print(f"  ✓ raw_palette.xml ({len(items)} items)")
+        f.write('<materials/>\n')
+    print(f"  ✓ materials.xml (empty)")
     
     # Generate clients.xml snippet
     snippet = """<!-- Add this to RME/data/clients.xml -->

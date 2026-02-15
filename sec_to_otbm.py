@@ -587,28 +587,35 @@ def parse_monster_db(monster_db_path):
 
 
 def parse_npc_files(npc_dir):
-    """Parse .npc files to extract NPC spawn data"""
+    """Parse .npc files to extract NPC spawn data and outfit info (using Name field for display)"""
     npc_spawns = []
+    npc_creatures = {}  # For creatures.xml generation
     
     npc_dir = Path(npc_dir)
     if not npc_dir.exists():
-        return npc_spawns
+        return npc_spawns, npc_creatures
     
     for npc_file in npc_dir.glob("*.npc"):
-        name = None
+        # Use filename for internal tracking
+        npc_filename = npc_file.stem
+        
+        display_name = None  # Name field - this is what we'll use in XML
         home_x = home_y = home_z = None
         radius = 3
+        looktype = None
+        lookhead = lookbody = looklegs = lookfeet = 0
         
         with open(npc_file, 'r', encoding='latin-1', errors='ignore') as f:
             for line in f:
                 line = line.strip()
                 
-                if line.startswith('Name'):
+                # Parse Name field for display name (to avoid .mon conflicts)
+                if line.startswith('Name') and '=' in line:
                     try:
-                        name = line.split('=', 1)[1].strip().strip('"')
+                        display_name = line.split('=', 1)[1].strip().strip('"')
                     except:
                         pass
-                elif line.startswith('Home'):
+                elif line.startswith('Home') and '=' in line:
                     try:
                         coords = line.split('=')[1].strip().strip('[]')
                         parts = coords.split(',')
@@ -617,22 +624,52 @@ def parse_npc_files(npc_dir):
                         home_z = int(parts[2])
                     except:
                         pass
-                elif line.startswith('Radius'):
+                elif line.startswith('Radius') and '=' in line:
                     try:
                         radius = int(line.split('=')[1].strip())
                     except:
                         pass
+                elif line.startswith('Outfit') and '=' in line:
+                    outfit_str = line.split('=', 1)[1].strip().strip('()')
+                    try:
+                        # Format: (looktype, head-body-legs-feet)
+                        parts = outfit_str.split(',', 1)
+                        looktype = int(parts[0].strip()) if len(parts) > 0 else None
+                        if len(parts) > 1:
+                            colors = parts[1].strip().split('-')
+                            lookhead = int(colors[0]) if len(colors) > 0 else 0
+                            lookbody = int(colors[1]) if len(colors) > 1 else 0
+                            looklegs = int(colors[2]) if len(colors) > 2 else 0
+                            lookfeet = int(colors[3]) if len(colors) > 3 else 0
+                    except:
+                        pass
         
-        if name and home_x is not None:
+        # Use display_name (from Name field) to avoid .mon conflicts
+        if not display_name:
+            display_name = npc_filename  # Fallback to filename if no Name field
+        
+        # Add to spawn list if has position
+        if home_x is not None:
             npc_spawns.append({
-                'name': name,
+                'name': display_name,  # Use Name field
                 'x': home_x,
                 'y': home_y,
                 'z': home_z,
                 'radius': radius
             })
+        
+        # Add to creatures dict if has outfit
+        if looktype:
+            npc_creatures[display_name] = {
+                'name': display_name,  # Use Name field
+                'looktype': looktype,
+                'lookhead': lookhead,
+                'lookbody': lookbody,
+                'looklegs': looklegs,
+                'lookfeet': lookfeet
+            }
     
-    return npc_spawns
+    return npc_spawns, npc_creatures
 
 
 def generate_spawns_xml(monster_db_path, mon_dir, npc_dir, output_path, sectors):
@@ -648,7 +685,7 @@ def generate_spawns_xml(monster_db_path, mon_dir, npc_dir, output_path, sectors)
     monster_spawns = parse_monster_db(monster_db_path)
     print(f"Found {len(monster_spawns)} monster spawn entries")
     
-    npc_spawns = parse_npc_files(npc_dir)
+    npc_spawns, npc_creatures = parse_npc_files(npc_dir)
     print(f"Found {len(npc_spawns)} NPC spawns")
     
     # Build walkable tile set from map
@@ -658,6 +695,7 @@ def generate_spawns_xml(monster_db_path, mon_dir, npc_dir, output_path, sectors)
     
     # Track globally used tiles to avoid conflicts
     global_used_tiles = set()
+    global_spawn_centers = set()  # Track spawn centers to avoid duplicates
     
     xml_lines = ['<?xml version="1.0"?>']
     xml_lines.append('<spawns>')
@@ -677,6 +715,9 @@ def generate_spawns_xml(monster_db_path, mon_dir, npc_dir, output_path, sectors)
         center_y = spawn['y']
         z = spawn['z']
         amount = spawn['amount']
+        
+        # Mark this spawn center as used
+        global_spawn_centers.add((center_x, center_y, z))
         
         # Place creatures and track their offsets
         creature_offsets = []
@@ -744,30 +785,88 @@ def generate_spawns_xml(monster_db_path, mon_dir, npc_dir, output_path, sectors)
         
         xml_lines.append('\t</spawn>')
     
-    # Add NPC spawns (also check walkability)
+    # Add NPC spawns (with smart offset search to avoid duplicate centers)
+    npc_count = 0
     for npc in npc_spawns:
-        x = npc['x']
-        y = npc['y']
+        original_center_x = npc['x']
+        original_center_y = npc['y']
         z = npc['z']
         
-        tile = (x, y, z)
+        # Find a spawn center that isn't already used
+        center_x = original_center_x
+        center_y = original_center_y
+        center_found = False
         
-        if tile not in walkable_tiles:
-            print(f"  ⚠ Warning: NPC '{npc['name']}' at ({x}, {y}, {z}) is on non-walkable tile, skipping")
-            continue
+        # Check if original center is available
+        if (center_x, center_y, z) not in global_spawn_centers:
+            # Check if we can place NPC at this center
+            tile = (center_x, center_y, z)
+            if tile in walkable_tiles and tile not in global_used_tiles:
+                global_spawn_centers.add((center_x, center_y, z))
+                global_used_tiles.add(tile)
+                center_found = True
+                final_dx = 0
+                final_dy = 0
         
-        if tile in global_used_tiles:
-            print(f"  ⚠ Warning: NPC '{npc['name']}' conflicts with monster at ({x}, {y}, {z}), skipping")
-            continue
+        if not center_found:
+            # Try offsetting the spawn CENTER (not just the creature)
+            # Try cardinal directions: +X, -X, +Y, -Y
+            for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+                new_center_x = original_center_x + dx
+                new_center_y = original_center_y + dy
+                
+                if (new_center_x, new_center_y, z) not in global_spawn_centers:
+                    # Can we place NPC at this new center?
+                    tile = (new_center_x, new_center_y, z)
+                    if tile in walkable_tiles and tile not in global_used_tiles:
+                        center_x = new_center_x
+                        center_y = new_center_y
+                        global_spawn_centers.add((center_x, center_y, z))
+                        global_used_tiles.add(tile)
+                        center_found = True
+                        final_dx = 0
+                        final_dy = 0
+                        break
         
-        xml_lines.append(
-            f'\t<spawn centerx="{x}" centery="{y}" '
-            f'centerz="{z}" radius="1">'
-        )
-        xml_lines.append(
-            f'\t\t<npc name="{npc["name"]}" x="0" y="0" z="{z}" spawntime="60"/>'
-        )
-        xml_lines.append('\t</spawn>')
+        if not center_found:
+            # Spiral search for a completely new center position
+            for radius in range(2, 10):
+                if center_found:
+                    break
+                for dx in range(-radius, radius + 1):
+                    for dy in range(-radius, radius + 1):
+                        if abs(dx) == radius or abs(dy) == radius:
+                            new_center_x = original_center_x + dx
+                            new_center_y = original_center_y + dy
+                            
+                            if (new_center_x, new_center_y, z) not in global_spawn_centers:
+                                tile = (new_center_x, new_center_y, z)
+                                if tile in walkable_tiles and tile not in global_used_tiles:
+                                    center_x = new_center_x
+                                    center_y = new_center_y
+                                    global_spawn_centers.add((center_x, center_y, z))
+                                    global_used_tiles.add(tile)
+                                    center_found = True
+                                    final_dx = 0
+                                    final_dy = 0
+                                    break
+                        if center_found:
+                            break
+                    if center_found:
+                        break
+        
+        if center_found:
+            xml_lines.append(
+                f'\t<spawn centerx="{center_x}" centery="{center_y}" '
+                f'centerz="{z}" radius="1">'
+            )
+            xml_lines.append(
+                f'\t\t<npc name="{npc["name"]}" x="{final_dx}" y="{final_dy}" z="{z}" spawntime="60"/>'
+            )
+            xml_lines.append('\t</spawn>')
+            npc_count += 1
+        else:
+            print(f"  ⚠ Warning: Could not place NPC '{npc['name']}' near ({original_center_x}, {original_center_y}, {z}) - no available spawn centers")
     
     xml_lines.append('</spawns>')
     
@@ -775,7 +874,7 @@ def generate_spawns_xml(monster_db_path, mon_dir, npc_dir, output_path, sectors)
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(xml_lines))
     
-    print(f"✓ Spawns XML generated: {total_creatures} monsters, {len(npc_spawns)} NPCs")
+    print(f"✓ Spawns XML generated: {total_creatures} monsters, {npc_count} NPCs")
     print(f"  ✓ All creatures placed on walkable tiles")
     if skipped_unwalkable > 0:
         print(f"  ℹ Skipped {skipped_unwalkable} non-walkable positions during placement")
@@ -851,7 +950,7 @@ def main():
     else:
         print(f"\n⚠ Skipping houses (missing {houses_dat} or {houseareas_dat})")
     
-    # Generate spawns XML (pass sectors for walkability checking)
+    # Generate spawns XML (reuse npc_spawns and npc_creatures from earlier)
     monster_db = dat_dir / 'monster.db'
     
     if monster_db.exists():
