@@ -10,3 +10,13 @@ Convert Open Tibia Map Binary to and from Official CipSoft Sector Map files
 
 ### Stone wall for spawn sprite
 `1507 stone wall hardcoded into RME`
+
+### Omitted RemainingExpireTime on pools/SavedExpireTime on torches
+`No sensible field & server gives default`
+
+### Omitted RemainingUses on ice rapier (3284)
+`No sensible field & server gives default`
+
+Prefer no wall when shifting spawns
+
+parse moveuse.dat
