@@ -332,8 +332,8 @@ def parse_mon_files(mon_dir):
         
         filepath = mon_dir / filename
         
-        # Use filename (without .mon) as the creature name
-        creature_name = filename.replace('.mon', '')
+        # Use filename with "mon-" prefix (e.g. demon.mon -> mon-demon)
+        creature_name = 'mon-' + filename.replace('.mon', '')
         
         with open(filepath, 'r', encoding='latin-1', errors='ignore') as f:
             lines = f.readlines()
@@ -420,14 +420,6 @@ def generate_creatures_xml(creatures, npc_creatures, output_path):
     # Build new tree with proper formatting
     root = etree.Element('creatures')
     root.text = '\n\t'
-    
-    comment1 = etree.Comment(' this file is for indexing only ')
-    comment1.tail = '\n\t'
-    root.append(comment1)
-    
-    comment2 = etree.Comment(' for sorting see creature_palette.xml ')
-    comment2.tail = '\n\t'
-    root.append(comment2)
     
     for i, c in enumerate(all_creatures):
         creature_elem = etree.Element('creature')
@@ -907,7 +899,7 @@ def parse_monsters_db(monsters_db_path):
 
 
 def parse_npc_files(npc_dir):
-    """Parse .npc files to extract NPC spawn data and outfit info (using Name field)"""
+    """Parse .npc files to extract NPC spawn data and outfit info (using filename with npc- prefix)"""
     npc_spawns = []
     npc_creatures = {}  # For creatures.xml generation
     
@@ -917,8 +909,9 @@ def parse_npc_files(npc_dir):
     
     for npc_file in npc_dir.glob("*.npc"):
         npc_filename = npc_file.stem
+        # Use filename with "npc-" prefix (e.g. frans.npc -> npc-frans)
+        display_name = 'npc-' + npc_filename
         
-        display_name = None  # Name field - used to avoid .mon filename conflicts
         home_x = home_y = home_z = None
         radius = 3
         looktype = None
@@ -928,12 +921,8 @@ def parse_npc_files(npc_dir):
             for line in f:
                 line = line.strip()
                 
-                # Parse Name field (e.g., "A Wrinkled Beholder")
                 if line.startswith('Name') and '=' in line:
-                    try:
-                        display_name = line.split('=', 1)[1].strip().strip('"')
-                    except:
-                        pass
+                    pass  # Name field no longer used for creature id; we use filename + npc- prefix
                 elif line.startswith('Home') and '=' in line:
                     try:
                         coords = line.split('=')[1].strip().strip('[]')
@@ -963,11 +952,7 @@ def parse_npc_files(npc_dir):
                     except:
                         pass
         
-        # Use display_name (from Name field) to avoid .mon conflicts
-        if not display_name:
-            display_name = npc_filename  # Fallback to filename if no Name field
-        
-        # Add to spawn list if has position
+        # Add to spawn list if has position (display_name is npc- + filename)
         if home_x is not None:
             npc_spawns.append({
                 'name': display_name,

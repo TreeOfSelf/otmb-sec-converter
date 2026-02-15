@@ -683,8 +683,8 @@ def build_race_lookup(mon_dir):
     for mon_file in mon_dir.glob("*.mon"):
         race_number = None
         
-        # Use filename without .mon extension (this matches RME creatures.xml format)
-        monster_name = mon_file.stem  # e.g., "demonskeleton.mon" → "demonskeleton"
+        # Use filename with "mon-" prefix (matches RME creatures.xml and spawn XML)
+        monster_name = 'mon-' + mon_file.stem  # e.g., "demonskeleton.mon" → "mon-demonskeleton"
         
         with open(mon_file, 'r', encoding='latin-1', errors='ignore') as f:
             for line in f:
@@ -736,7 +736,7 @@ def parse_monster_db(monster_db_path):
 
 
 def parse_npc_files(npc_dir):
-    """Parse .npc files to extract NPC spawn data and outfit info (using Name field for display)"""
+    """Parse .npc files to extract NPC spawn data and outfit info (using filename with npc- prefix)"""
     npc_spawns = []
     npc_creatures = {}  # For creatures.xml generation
     
@@ -745,10 +745,10 @@ def parse_npc_files(npc_dir):
         return npc_spawns, npc_creatures
     
     for npc_file in npc_dir.glob("*.npc"):
-        # Use filename for internal tracking
         npc_filename = npc_file.stem
+        # Use filename with "npc-" prefix (e.g. frans.npc -> npc-frans); matches RME creatures.xml
+        display_name = 'npc-' + npc_filename
         
-        display_name = None  # Name field - this is what we'll use in XML
         home_x = home_y = home_z = None
         radius = 3
         looktype = None
@@ -758,12 +758,8 @@ def parse_npc_files(npc_dir):
             for line in f:
                 line = line.strip()
                 
-                # Parse Name field for display name (to avoid .mon conflicts)
                 if line.startswith('Name') and '=' in line:
-                    try:
-                        display_name = line.split('=', 1)[1].strip().strip('"')
-                    except:
-                        pass
+                    pass  # Name field no longer used for creature id; we use filename + npc- prefix
                 elif line.startswith('Home') and '=' in line:
                     try:
                         coords = line.split('=')[1].strip().strip('[]')
@@ -793,30 +789,26 @@ def parse_npc_files(npc_dir):
                     except:
                         pass
         
-        # Use display_name (from Name field) to avoid .mon conflicts
-        if not display_name:
-            display_name = npc_filename  # Fallback to filename if no Name field
-        
-        # Add to spawn list if has position
+        # Add to spawn list if has position (display_name is npc- + filename)
         if home_x is not None:
             npc_spawns.append({
-                'name': display_name,  # Use Name field
+                'name': display_name,
                 'x': home_x,
                 'y': home_y,
                 'z': home_z,
                 'radius': radius
             })
         
-        # Add to creatures dict if has outfit
-        if looktype:
-            npc_creatures[display_name] = {
-                'name': display_name,  # Use Name field
-                'looktype': looktype,
-                'lookhead': lookhead,
-                'lookbody': lookbody,
-                'looklegs': looklegs,
-                'lookfeet': lookfeet
-            }
+        # Add to creatures dict (for consistency; spawn XML uses name npc- + filename)
+        effective_looktype = looktype if (looktype is not None and looktype != 0) else 130
+        npc_creatures[display_name] = {
+            'name': display_name,
+            'looktype': effective_looktype,
+            'lookhead': lookhead,
+            'lookbody': lookbody,
+            'looklegs': looklegs,
+            'lookfeet': lookfeet
+        }
     
     return npc_spawns, npc_creatures
 
