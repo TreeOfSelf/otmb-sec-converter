@@ -36,6 +36,8 @@ OTBM_ITEM = 0x06
 OTBM_ATTR_DESCRIPTION = 0x01
 OTBM_ATTR_EXT_SPAWN_FILE = 11   # RME: spawn filename in same dir as .otbm
 OTBM_ATTR_EXT_HOUSE_FILE = 13   # RME: house filename in same dir as .otbm
+OTBM_TOWNS = 12
+OTBM_TOWN = 13
 
 
 # ============================================================================
@@ -84,6 +86,135 @@ class OTBMWriter:
     def get_bytes(self):
         """Return the complete byte array"""
         return bytes(self.data)
+
+
+# ============================================================================
+# Parse moveuse.dat Hometeleporters for temple positions (SetStart x,y,z)
+# ============================================================================
+def parse_temples_from_moveuse(moveuse_path):
+    """
+    Parse tibia-game/dat/moveuse.dat section BEGIN "Hometeleporters".
+    Lines with SetStart(Obj2,[x,y,z]) and "Home TownName (1)" give the actual temple position.
+    Returns dict: town_name -> (x, y, z). Uses first occurrence per town (prefer " (1)" over " (?)").
+    """
+    path = Path(moveuse_path)
+    if not path.exists():
+        return {}
+
+    temples = {}  # town_name -> (x, y, z)
+    in_section = False
+
+    with open(path, 'r', encoding='latin-1', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            if line == 'BEGIN "Hometeleporters"':
+                in_section = True
+                continue
+            if in_section:
+                if line.startswith('BEGIN ') or line == 'END':
+                    break
+                # Line must have SetStart(Obj2,[x,y,z]) and "Home ... (1)" or "Home ... (?)"
+                if 'SetStart(Obj2,' not in line or '"Home ' not in line:
+                    continue
+                try:
+                    # Coords: SetStart(Obj2,[32369,32241,07]) -> 32369, 32241, 7
+                    i = line.index('SetStart(Obj2,[') + len('SetStart(Obj2,[')
+                    j = line.index('])', i)
+                    coord_str = line[i:j]  # "32369,32241,07"
+                    coords = [int(c.strip()) for c in coord_str.split(',')]
+                    x, y, z = coords[0], coords[1], coords[2]
+                    # Town name: "Home Thais (1)" or "Home Port Hope (1)" -> Thais / Port Hope
+                    label_start = line.index('"Home ') + len('"Home ')
+                    label_end_1 = line.find(' (1)"', label_start)
+                    label_end_2 = line.find(' (?)"', label_start)
+                    if label_end_1 != -1:
+                        label_end = label_end_1
+                    elif label_end_2 != -1:
+                        label_end = label_end_2
+                    else:
+                        continue
+                    name = line[label_start:label_end]
+                    # Prefer (1) over (?): only overwrite if we don't have this name yet, or if current is (1)
+                    if name not in temples or ' (1)"' in line:
+                        temples[name] = (x, y, z)
+                        temples[name.replace(' ', '')] = (x, y, z)  # "Port Hope" -> "PortHope"
+                except (ValueError, IndexError):
+                    continue
+
+    return temples
+
+
+# ============================================================================
+# Parse map.dat for towns (Depot = id+name); temple from moveuse or Mark
+# ============================================================================
+def parse_map_dat(map_dat_path, temple_positions=None):
+    """
+    Parse tibia-game/dat/map.dat for Depots (town id + name).
+    Temple position: use temple_positions[name] if provided (from moveuse Hometeleporters),
+    else fall back to Mark lines in map.dat.
+    Returns list of dicts: [{'id': town_id, 'name': str, 'x': int, 'y': int, 'z': int}, ...]
+    town_id = depot_id + 1 (Thais depot 0 -> town 1).
+    """
+    path = Path(map_dat_path)
+    if not path.exists():
+        return []
+
+    depots = []   # (depot_id, name)
+    marks = {}    # name -> (x, y, z); fallback from map.dat Mark lines
+
+    with open(path, 'r', encoding='latin-1', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            if line.startswith('Depot'):
+                # Depot = (0,"Thais",1000)
+                try:
+                    rest = line.split('=', 1)[1].strip().strip('()')
+                    parts = [p.strip() for p in rest.split(',', 2)]
+                    depot_id = int(parts[0])
+                    name = parts[1].strip('"')
+                    depots.append((depot_id, name))
+                except (ValueError, IndexError):
+                    continue
+
+            elif line.startswith('Mark'):
+                # Mark = ("Thais",[32369,32215,7])  (fallback if no moveuse temples)
+                try:
+                    rest = line.split('=', 1)[1].strip()
+                    name_start = rest.index('"') + 1
+                    name_end = rest.index('"', name_start)
+                    name = rest[name_start:name_end]
+                    bracket_start = rest.index('[')
+                    bracket_end = rest.index(']', bracket_start)
+                    rest = rest[bracket_start + 1 : bracket_end]
+                    coords = [int(c.strip()) for c in rest.split(',')]
+                    x, y, z = coords[0], coords[1], coords[2]
+                    marks[name] = (x, y, z)
+                    marks[name.replace(' ', '')] = (x, y, z)
+                except (ValueError, IndexError):
+                    continue
+
+    towns = []
+    for depot_id, name in depots:
+        # Prefer temple from moveuse.dat Hometeleporters (SetStart), else map.dat Mark
+        pos = None
+        if temple_positions:
+            pos = temple_positions.get(name) or temple_positions.get(name.replace(' ', ''))
+        if pos is None:
+            pos = marks.get(name) or marks.get(name.replace(' ', ''))
+        if pos is None:
+            continue
+        x, y, z = pos
+        town_id = depot_id + 1  # Depot 0 -> Town 1 (Thais)
+        towns.append({
+            'id': town_id,
+            'name': name,
+            'x': x, 'y': y, 'z': z
+        })
+
+    return towns
 
 
 # ============================================================================
@@ -253,12 +384,15 @@ def build_otbm_header(width, height):
     return writer.get_bytes()
 
 
-def convert_map_to_otbm(sectors, output_file, map_name):
+def convert_map_to_otbm(sectors, output_file, map_name, towns=None):
     """Convert .sec files to OTBM format"""
     
     print("\n" + "="*70)
     print("CONVERTING MAP TO OTBM")
     print("="*70)
+    
+    if towns is None:
+        towns = []
     
     if not sectors:
         print("Error: No valid sectors found!")
@@ -287,6 +421,21 @@ def convert_map_to_otbm(sectors, output_file, map_name):
     writer.write_string(f"{map_name}-spawn.xml")
     writer.write_byte(OTBM_ATTR_EXT_HOUSE_FILE)
     writer.write_string(f"{map_name}-house.xml")
+
+    # RME: OTBM_TOWNS with OTBM_TOWN children (id, name, temple x,y,z)
+    # Must come BEFORE tile areas
+    if towns:
+        writer.start_node(OTBM_TOWNS)
+        for t in towns:
+            writer.start_node(OTBM_TOWN)
+            writer.write_uint32(t['id'])
+            writer.write_string(t['name'])
+            writer.write_uint16(t['x'])
+            writer.write_uint16(t['y'])
+            writer.write_byte(t['z'])
+            writer.end_node()
+        writer.end_node()
+        print(f"  ✓ Wrote {len(towns)} towns (from map.dat)")
 
     areas = defaultdict(list)
     for (sx, sy, z), tiles in sectors.items():
@@ -344,8 +493,8 @@ def convert_map_to_otbm(sectors, output_file, map_name):
         if idx % 200 == 0:
             print(f"  Progress: {idx}/{len(areas)} areas...")
     
-    writer.end_node()
-    writer.end_node()
+    # FIXED: Only close MAP_DATA once (removed extra end_node)
+    writer.end_node()  # Close MAP_DATA
     
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
     
@@ -485,10 +634,10 @@ def generate_houses_xml(houses_path, houseareas_path, output_path):
         # Use ID directly from houses.dat
         house_id = house['id']
         
-        # Look up area to get depot, then townid = depot + 2
+        # Look up area to get depot, then townid = depot + 1
         area = house.get('area', 100)
         depot = area_to_depot.get(area, 0)
-        town_id = depot + 2  # Depot 0 → Town 2 (Thais), Depot 1 → Town 3 (Carlin), etc.
+        town_id = depot + 1  # Depot 0 → Town 1 (Thais), Depot 1 → Town 2 (Carlin), etc.
         
         # Use original coordinates
         entryx = house.get('entryx', 0)
@@ -930,11 +1079,27 @@ def main():
         print("\n❌ No valid sectors found!")
         sys.exit(1)
     
+    # Temple positions from moveuse.dat Hometeleporters (SetStart x,y,z); fallback to map.dat Mark
+    moveuse_dat = dat_dir / 'moveuse.dat'
+    temple_positions = parse_temples_from_moveuse(moveuse_dat)
+    if temple_positions:
+        print(f"\n✓ Loaded temple positions for {len(temple_positions)} towns from moveuse.dat (Hometeleporters)")
+    # Towns: depots from map.dat, temple from moveuse (preferred) or map.dat Mark
+    map_dat = dat_dir / 'map.dat'
+    towns = parse_map_dat(map_dat, temple_positions=temple_positions)
+    if towns:
+        print(f"✓ Loaded {len(towns)} towns (depots from map.dat, temples from moveuse.dat)")
+    elif map_dat.exists():
+        print(f"\n⚠ Warning: map.dat found but no towns parsed")
+    else:
+        print(f"\n⚠ Warning: map.dat not found, map will have no towns")
+    
     # Convert map
     convert_map_to_otbm(
         sectors,
         output_dir / f'{output_name}.otbm',
-        output_name
+        output_name,
+        towns=towns
     )
     
     # Generate houses XML
