@@ -239,6 +239,8 @@ def generate_items_otb(items, output_path):
             item_group = ITEM_GROUP_SPLASH  # LiquidPool = pool on ground; RME uses subtype (OTBM_ATTR_COUNT) as liquid
         elif 'LiquidContainer' in flags:
             item_group = ITEM_GROUP_FLUID  # RME uses subtype (OTBM_ATTR_COUNT) as liquid type for fluid containers
+        elif 'Teleport' in flags or 'TeleportAbsolute' in flags or 'TeleportRelative' in flags:
+            item_group = ITEM_GROUP_TELEPORT  # magic forcefield etc.; RME shows destination when type=teleport
         elif 'Rune' in flags or 'MagicEffect' in flags:
             item_group = ITEM_GROUP_RUNE
         else:
@@ -338,7 +340,7 @@ def generate_items_xml(items, output_path):
             item_elem.set('type', 'container')
         elif 'Splash' in flags or 'LiquidPool' in flags or 'LiquidContainer' in flags or 'LiquidSource' in flags:
             item_elem.set('type', 'splash')
-        elif 'Teleport' in flags:
+        elif 'Teleport' in flags or 'TeleportAbsolute' in flags or 'TeleportRelative' in flags:
             item_elem.set('type', 'teleport')
         elif 'Door' in flags or 'Hatch' in flags or 'Gate' in flags:
             item_elem.set('type', 'door')
