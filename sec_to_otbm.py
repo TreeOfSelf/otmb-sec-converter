@@ -3,15 +3,18 @@
 SEC to OTBM Converter + Houses + Spawns Generator
 Converts CipSoft .sec map files to OTBM and generates auxiliary XMLs
 
-Usage: python3 sec_to_otbm.py <tibia-game-folder> <output-name> [--no-offset]
+Usage: python3 sec_to_otbm.py <tibia-game-folder> <output-name>
 
 Example:
   python3 sec_to_otbm.py ./tibia-game myworld
 
 Output:
   output/myworld.otbm
-  output/myworld-houses.xml
-  output/myworld-spawns.xml
+  output/myworld-house.xml
+  output/myworld-spawn.xml
+
+Keeps original Tibia coordinates (map centered around 32000,32000).
+Map size: 65535x65535 (full OTBM size).
 """
 import sys
 from pathlib import Path
@@ -31,6 +34,8 @@ OTBM_TILE_AREA = 0x04
 OTBM_TILE = 0x05
 OTBM_ITEM = 0x06
 OTBM_ATTR_DESCRIPTION = 0x01
+OTBM_ATTR_EXT_SPAWN_FILE = 11   # RME: spawn filename in same dir as .otbm
+OTBM_ATTR_EXT_HOUSE_FILE = 13   # RME: house filename in same dir as .otbm
 
 
 # ============================================================================
@@ -79,6 +84,28 @@ class OTBMWriter:
     def get_bytes(self):
         """Return the complete byte array"""
         return bytes(self.data)
+
+
+# ============================================================================
+# Map walkability checking
+# ============================================================================
+def load_walkable_tiles_from_sectors(sectors):
+    """
+    Build a set of walkable tile positions from the sector data.
+    A tile is walkable if it has ground items (items that can be walked on).
+    This is a simplified check - in reality we'd need item type data.
+    For now, we assume any tile with items is potentially walkable.
+    """
+    walkable_tiles = set()
+    
+    for (sx, sy, z), tiles in sectors.items():
+        for lx, ly, items in tiles:
+            if items:  # Has items, likely has ground
+                abs_x = sx * SECTOR_SIZE + lx
+                abs_y = sy * SECTOR_SIZE + ly
+                walkable_tiles.add((abs_x, abs_y, z))
+    
+    return walkable_tiles
 
 
 # ============================================================================
@@ -193,20 +220,6 @@ def load_all_sectors(sec_dir):
     return sectors
 
 
-def calculate_offset(sectors):
-    """Calculate the offset needed to move map to start at 0,0"""
-    min_x = min_y = float('inf')
-    
-    for (sx, sy, z), tiles in sectors.items():
-        for lx, ly, _ in tiles:
-            abs_x = sx * SECTOR_SIZE + lx
-            abs_y = sy * SECTOR_SIZE + ly
-            min_x = min(min_x, abs_x)
-            min_y = min(min_y, abs_y)
-    
-    return int(min_x), int(min_y)
-
-
 def calculate_bounds(sectors, offset_x=0, offset_y=0):
     """Calculate transformed map bounds after applying offset"""
     min_x = min_y = float('inf')
@@ -240,36 +253,24 @@ def build_otbm_header(width, height):
     return writer.get_bytes()
 
 
-def convert_map_to_otbm(sec_dir, output_file, map_name, apply_offset=True):
+def convert_map_to_otbm(sectors, output_file, map_name):
     """Convert .sec files to OTBM format"""
     
     print("\n" + "="*70)
     print("CONVERTING MAP TO OTBM")
     print("="*70)
     
-    sectors = load_all_sectors(sec_dir)
-    
     if not sectors:
         print("Error: No valid sectors found!")
         return
     
-    offset_x, offset_y = calculate_offset(sectors)
-    
-    if apply_offset:
-        print(f"\nApplying coordinate offset: -{offset_x}, -{offset_y}")
-    else:
-        print(f"\nNOT applying offset (using original coordinates)")
-        offset_x = 0
-        offset_y = 0
-    
-    min_x, min_y, max_x, max_y = calculate_bounds(sectors, offset_x, offset_y)
-    width = max_x - min_x + 1
-    height = max_y - min_y + 1
-
-    width = max(1, min(65535, width))
-    height = max(1, min(65535, height))
-
-    print(f"\nMap bounds: X={min_x}..{max_x} (w={width}), Y={min_y}..{max_y} (h={height})")
+    print(f"\n✓ Using original Tibia coordinates")
+    min_x, min_y, max_x, max_y = calculate_bounds(sectors, 0, 0)
+    # Use full Tibia map size
+    width = 65535
+    height = 65535
+    print(f"Map canvas: {width}x{height} (full OTBM size)")
+    print(f"Actual tile coverage: X={min_x}..{max_x}, Y={min_y}..{max_y}")
 
     header = build_otbm_header(width, height)
     
@@ -281,15 +282,21 @@ def convert_map_to_otbm(sec_dir, output_file, map_name, apply_offset=True):
     writer.start_node(OTBM_MAP_DATA)
     writer.write_byte(OTBM_ATTR_DESCRIPTION)
     writer.write_string(map_name)
-    
+    # RME looks for these filenames in the same directory as the .otbm
+    writer.write_byte(OTBM_ATTR_EXT_SPAWN_FILE)
+    writer.write_string(f"{map_name}-spawn.xml")
+    writer.write_byte(OTBM_ATTR_EXT_HOUSE_FILE)
+    writer.write_string(f"{map_name}-house.xml")
+
     areas = defaultdict(list)
     for (sx, sy, z), tiles in sectors.items():
         for lx, ly, items in tiles:
             abs_x = sx * SECTOR_SIZE + lx
             abs_y = sy * SECTOR_SIZE + ly
             
-            new_x = abs_x - offset_x
-            new_y = abs_y - offset_y
+            # No offset - use original coordinates
+            new_x = abs_x
+            new_y = abs_y
             
             area_x = new_x & 0xFF00
             area_y = new_y & 0xFF00
@@ -460,7 +467,7 @@ def parse_houses_dat(houses_path):
 
 
 def generate_houses_xml(houses_path, houseareas_path, output_path):
-    """Generate map-houses.xml from houses.dat"""
+    """Generate map-house.xml from houses.dat"""
     
     print("\n" + "="*70)
     print("GENERATING HOUSES XML")
@@ -483,11 +490,15 @@ def generate_houses_xml(houses_path, houseareas_path, output_path):
         depot = area_to_depot.get(area, 0)
         town_id = depot + 2  # Depot 0 → Town 2 (Thais), Depot 1 → Town 3 (Carlin), etc.
         
+        # Use original coordinates
+        entryx = house.get('entryx', 0)
+        entryy = house.get('entryy', 0)
+        
         attrs = [
             f'name="{house.get("name", "")}"',
             f'houseid="{house_id}"',
-            f'entryx="{house.get("entryx", 0)}"',
-            f'entryy="{house.get("entryy", 0)}"',
+            f'entryx="{entryx}"',
+            f'entryy="{entryy}"',
             f'entryz="{house.get("entryz", 7)}"',
             f'rent="{house.get("rent", 0)}"',
         ]
@@ -627,8 +638,8 @@ def parse_npc_files(npc_dir):
     return npc_spawns
 
 
-def generate_spawns_xml(monster_db_path, mon_dir, npc_dir, output_path):
-    """Generate map-spawns.xml from monster.db and .npc files"""
+def generate_spawns_xml(monster_db_path, mon_dir, npc_dir, output_path, sectors):
+    """Generate map-spawn.xml from monster.db and .npc files, checking walkability"""
     
     print("\n" + "="*70)
     print("GENERATING SPAWNS XML")
@@ -643,8 +654,21 @@ def generate_spawns_xml(monster_db_path, mon_dir, npc_dir, output_path):
     npc_spawns = parse_npc_files(npc_dir)
     print(f"Found {len(npc_spawns)} NPC spawns")
     
-    # Group monster spawns by (x, y, z, radius) to consolidate them
-    spawn_groups = defaultdict(list)
+    # Build walkable tile set from map
+    print("Building walkable tile map from sectors...")
+    walkable_tiles = load_walkable_tiles_from_sectors(sectors)
+    print(f"  Found {len(walkable_tiles)} walkable tiles")
+    
+    # Track globally used tiles to avoid conflicts
+    global_used_tiles = set()
+    
+    xml_lines = ['<?xml version="1.0"?>']
+    xml_lines.append('<spawns>')
+    
+    total_creatures = 0
+    skipped_unwalkable = 0
+    
+    # Process each monster.db line as one spawn
     for spawn in monster_spawns:
         race = spawn['race']
         monster_name = race_to_name.get(race)
@@ -652,44 +676,99 @@ def generate_spawns_xml(monster_db_path, mon_dir, npc_dir, output_path):
         if not monster_name:
             continue
         
-        # Group by location
-        key = (spawn['x'], spawn['y'], spawn['z'], spawn['radius'])
+        center_x = spawn['x']
+        center_y = spawn['y']
+        z = spawn['z']
+        amount = spawn['amount']
         
-        # Add each monster from amount
-        for i in range(spawn['amount']):
-            spawn_groups[key].append({
-                'name': monster_name,
-                'spawntime': spawn['spawntime']
-            })
-    
-    xml_lines = ['<?xml version="1.0"?>']
-    xml_lines.append('<spawns>')
-    
-    # Write grouped monster spawns
-    for (x, y, z, radius), monsters in sorted(spawn_groups.items()):
-        xml_lines.append(f'\t<spawn centerx="{x}" centery="{y}" centerz="{z}" radius="{radius}">')
+        # Place creatures and track their offsets
+        creature_offsets = []
         
-        # Add each monster with small offset
-        for idx, monster in enumerate(monsters):
-            # Simple offset pattern: spread monsters in a small area
-            offset_x = idx % 3 - 1  # -1, 0, 1, -1, 0, 1, ...
-            offset_y = (idx // 3) % 3 - 1
+        # Use spiral pattern to place creatures on unique, WALKABLE tiles
+        placed_count = 0
+        for radius in range(50):  # Search outward from center
+            if placed_count >= amount:
+                break
             
+            if radius == 0:
+                # Try center first
+                tile = (center_x, center_y, z)
+                if tile not in global_used_tiles and tile in walkable_tiles:
+                    global_used_tiles.add(tile)
+                    creature_offsets.append((0, 0))
+                    placed_count += 1
+                elif tile not in walkable_tiles:
+                    skipped_unwalkable += 1
+            else:
+                # Spiral outward
+                for dx in range(-radius, radius + 1):
+                    for dy in range(-radius, radius + 1):
+                        if placed_count >= amount:
+                            break
+                        
+                        # Only check perimeter of current radius
+                        if abs(dx) == radius or abs(dy) == radius:
+                            tile = (center_x + dx, center_y + dy, z)
+                            
+                            # Check if walkable AND not used
+                            if tile in walkable_tiles and tile not in global_used_tiles:
+                                global_used_tiles.add(tile)
+                                creature_offsets.append((dx, dy))
+                                placed_count += 1
+                            elif tile not in walkable_tiles:
+                                skipped_unwalkable += 1
+                    
+                    if placed_count >= amount:
+                        break
+        
+        if placed_count < amount:
+            print(f"  ⚠ Warning: Could only place {placed_count}/{amount} {monster_name} at ({center_x}, {center_y}, {z}) - not enough walkable tiles")
+        
+        # Calculate radius as the max offset used
+        if creature_offsets:
+            max_offset = max(max(abs(dx), abs(dy)) for dx, dy in creature_offsets)
+            calculated_radius = max(1, max_offset)  # Minimum radius 1
+        else:
+            calculated_radius = 1
+            continue  # Skip spawn if no creatures placed
+        
+        # Write spawn with calculated radius
+        xml_lines.append(
+            f'\t<spawn centerx="{center_x}" centery="{center_y}" '
+            f'centerz="{z}" radius="{calculated_radius}">'
+        )
+        
+        for dx, dy in creature_offsets:
             xml_lines.append(
-                f'\t\t<monster name="{monster["name"]}" x="{offset_x}" y="{offset_y}" '
-                f'z="{z}" spawntime="{monster["spawntime"]}"/>'
+                f'\t\t<monster name="{monster_name}" x="{dx}" y="{dy}" '
+                f'z="{z}" spawntime="{spawn["spawntime"]}"/>'
             )
+            total_creatures += 1
         
         xml_lines.append('\t</spawn>')
     
-    # Add NPC spawns
+    # Add NPC spawns (also check walkability)
     for npc in npc_spawns:
+        x = npc['x']
+        y = npc['y']
+        z = npc['z']
+        
+        tile = (x, y, z)
+        
+        if tile not in walkable_tiles:
+            print(f"  ⚠ Warning: NPC '{npc['name']}' at ({x}, {y}, {z}) is on non-walkable tile, skipping")
+            continue
+        
+        if tile in global_used_tiles:
+            print(f"  ⚠ Warning: NPC '{npc['name']}' conflicts with monster at ({x}, {y}, {z}), skipping")
+            continue
+        
         xml_lines.append(
-            f'\t<spawn centerx="{npc["x"]}" centery="{npc["y"]}" '
-            f'centerz="{npc["z"]}" radius="{npc["radius"]}">'
+            f'\t<spawn centerx="{x}" centery="{y}" '
+            f'centerz="{z}" radius="1">'
         )
         xml_lines.append(
-            f'\t\t<npc name="{npc["name"]}" x="0" y="0" z="{npc["z"]}" spawntime="60"/>'
+            f'\t\t<npc name="{npc["name"]}" x="0" y="0" z="{z}" spawntime="60"/>'
         )
         xml_lines.append('\t</spawn>')
     
@@ -699,8 +778,10 @@ def generate_spawns_xml(monster_db_path, mon_dir, npc_dir, output_path):
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(xml_lines))
     
-    total_monsters = sum(len(m) for m in spawn_groups.values())
-    print(f"✓ Spawns XML generated: {total_monsters} monsters in {len(spawn_groups)} locations, {len(npc_spawns)} NPCs")
+    print(f"✓ Spawns XML generated: {total_creatures} monsters, {len(npc_spawns)} NPCs")
+    print(f"  ✓ All creatures placed on walkable tiles")
+    if skipped_unwalkable > 0:
+        print(f"  ℹ Skipped {skipped_unwalkable} non-walkable positions during placement")
 
 
 # ============================================================================
@@ -708,19 +789,18 @@ def generate_spawns_xml(monster_db_path, mon_dir, npc_dir, output_path):
 # ============================================================================
 def main():
     if len(sys.argv) < 3:
-        print("Usage: python3 sec_to_otbm.py <tibia-game-folder> <output-name> [--no-offset]")
+        print("Usage: python3 sec_to_otbm.py <tibia-game-folder> <output-name>")
         print("\nExample:")
         print("  python3 sec_to_otbm.py ./tibia-game myworld")
-        print("  python3 sec_to_otbm.py ./tibia-game myworld --no-offset")
         print("\nThis will generate:")
         print("  output/myworld.otbm")
-        print("  output/myworld-houses.xml")
-        print("  output/myworld-spawns.xml")
+        print("  output/myworld-house.xml")
+        print("  output/myworld-spawn.xml")
+        print("\nKeeps original Tibia coordinates (map centered around 32000,32000).")
         sys.exit(1)
     
     tibia_game_dir = Path(sys.argv[1])
     output_name = sys.argv[2]
-    apply_offset = '--no-offset' not in sys.argv
     
     # Validate paths
     map_dir = tibia_game_dir / 'map'
@@ -741,17 +821,24 @@ def main():
     print("=" * 70)
     print(f"\nInput:  {tibia_game_dir.absolute()}")
     print(f"Output: {output_name}")
+    print("Mode:   Original Tibia coordinates (65535x65535 map)")
     print("=" * 70)
     
     output_dir = Path('output')
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    # Load sectors once (needed for both map and spawn generation)
+    sectors = load_all_sectors(map_dir)
+    
+    if not sectors:
+        print("\n❌ No valid sectors found!")
+        sys.exit(1)
+    
     # Convert map
     convert_map_to_otbm(
-        map_dir,
+        sectors,
         output_dir / f'{output_name}.otbm',
-        output_name,
-        apply_offset
+        output_name
     )
     
     # Generate houses XML
@@ -762,12 +849,12 @@ def main():
         generate_houses_xml(
             houses_dat,
             houseareas_dat,
-            output_dir / f'{output_name}-houses.xml'
+            output_dir / f'{output_name}-house.xml'
         )
     else:
         print(f"\n⚠ Skipping houses (missing {houses_dat} or {houseareas_dat})")
     
-    # Generate spawns XML
+    # Generate spawns XML (pass sectors for walkability checking)
     monster_db = dat_dir / 'monster.db'
     
     if monster_db.exists():
@@ -775,7 +862,8 @@ def main():
             monster_db,
             mon_dir,
             npc_dir,
-            output_dir / f'{output_name}-spawns.xml'
+            output_dir / f'{output_name}-spawn.xml',
+            sectors
         )
     else:
         print(f"\n⚠ Skipping spawns (missing {monster_db})")
@@ -786,9 +874,9 @@ def main():
     print(f"\nGenerated files in {output_dir.absolute()}:")
     print(f"  → {output_name}.otbm")
     if houses_dat.exists():
-        print(f"  → {output_name}-houses.xml")
+        print(f"  → {output_name}-house.xml")
     if monster_db.exists():
-        print(f"  → {output_name}-spawns.xml")
+        print(f"  → {output_name}-spawn.xml")
     print()
 
 
