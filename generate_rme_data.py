@@ -365,11 +365,16 @@ def parse_mon_files(mon_dir):
                 except:
                     pass
         
-        if looktype:
+        # Fallback: if no valid looktype (0 or None), use RaceNumber so RME shows something
+        effective_looktype = looktype if (looktype is not None and looktype != 0) else race_number
+        if effective_looktype is None:
+            effective_looktype = 0
+        # Include when we have outfit and/or race (so we have a look)
+        if looktype is not None or race_number is not None:
             creatures[creature_name] = {
                 'name': creature_name,
                 'race_number': race_number,
-                'looktype': looktype,
+                'looktype': effective_looktype,
                 'lookhead': lookhead,
                 'lookbody': lookbody,
                 'looklegs': looklegs,
@@ -428,10 +433,7 @@ def generate_creatures_xml(creatures, npc_creatures, output_path):
         creature_elem = etree.Element('creature')
         creature_elem.set('name', c['name'])
         creature_elem.set('type', c['type'])
-        
-        if c['looktype']:
-            creature_elem.set('looktype', c['looktype'])
-        
+        creature_elem.set('looktype', c['looktype'])  # 0 is valid
         if c['lookhead']:
             creature_elem.set('lookhead', c['lookhead'])
         if c['lookbody']:
@@ -974,17 +976,16 @@ def parse_npc_files(npc_dir):
                 'z': home_z,
                 'radius': radius
             })
-        
-        # Add to creatures dict if has outfit
-        if looktype:
-            npc_creatures[display_name] = {
-                'name': display_name,
-                'looktype': looktype,
-                'lookhead': lookhead,
-                'lookbody': lookbody,
-                'looklegs': looklegs,
-                'lookfeet': lookfeet
-            }
+        # Add to creatures dict: every NPC; fallback looktype 130 (wizard) if 0 or missing
+        effective_looktype = (looktype if (looktype is not None and looktype != 0) else 130)
+        npc_creatures[display_name] = {
+            'name': display_name,
+            'looktype': effective_looktype,
+            'lookhead': lookhead,
+            'lookbody': lookbody,
+            'looklegs': looklegs,
+            'lookfeet': lookfeet
+        }
     
     return npc_spawns, npc_creatures
 
