@@ -422,21 +422,6 @@ def convert_map_to_otbm(sectors, output_file, map_name, towns=None):
     writer.write_byte(OTBM_ATTR_EXT_HOUSE_FILE)
     writer.write_string(f"{map_name}-house.xml")
 
-    # RME: OTBM_TOWNS with OTBM_TOWN children (id, name, temple x,y,z)
-    # Must come BEFORE tile areas
-    if towns:
-        writer.start_node(OTBM_TOWNS)
-        for t in towns:
-            writer.start_node(OTBM_TOWN)
-            writer.write_uint32(t['id'])
-            writer.write_string(t['name'])
-            writer.write_uint16(t['x'])
-            writer.write_uint16(t['y'])
-            writer.write_byte(t['z'])
-            writer.end_node()
-        writer.end_node()
-        print(f"  ✓ Wrote {len(towns)} towns (from map.dat)")
-
     areas = defaultdict(list)
     for (sx, sy, z), tiles in sectors.items():
         for lx, ly, items in tiles:
@@ -493,7 +478,20 @@ def convert_map_to_otbm(sectors, output_file, map_name, towns=None):
         if idx % 200 == 0:
             print(f"  Progress: {idx}/{len(areas)} areas...")
     
-    # FIXED: Only close MAP_DATA once (removed extra end_node)
+    # RME: OTBM_TOWNS after TILE_AREA so getOrCreateTile(temple) finds existing tile (no duplicate-tile warning)
+    if towns:
+        writer.start_node(OTBM_TOWNS)
+        for t in towns:
+            writer.start_node(OTBM_TOWN)
+            writer.write_uint32(t['id'])
+            writer.write_string(t['name'])
+            writer.write_uint16(t['x'])
+            writer.write_uint16(t['y'])
+            writer.write_byte(t['z'])
+            writer.end_node()
+        writer.end_node()
+        print(f"  ✓ Wrote {len(towns)} towns (after tile areas)")
+    
     writer.end_node()  # Close MAP_DATA
     
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
