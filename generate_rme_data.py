@@ -16,12 +16,15 @@ from lxml import etree
 from collections import defaultdict
 
 # ============================================================================
-# OTB/OTBM Constants
+# OTB/OTBM Constants (RME items.h itemflags_t, items.cpp loadFromOtbVer1)
 # ============================================================================
 ITEM_ATTR_SERVERID = 0x10
 ITEM_ATTR_CLIENTID = 0x11
 ITEM_ATTR_NAME = 0x12
 ITEM_ATTR_SPEED = 0x14
+
+# RME items.h FLAG_* — OTB item node has uint32 flags after group byte; RME sets stackable from FLAG_STACKABLE
+FLAG_STACKABLE = 1 << 7
 
 ITEM_GROUP_NONE = 0x00
 ITEM_GROUP_GROUND = 0x01
@@ -221,8 +224,9 @@ def generate_items_otb(items, output_path):
         # Build item node
         item_data = bytearray()
         
-        # Flags (4 bytes, all zeros)
-        item_data.extend([0x00, 0x00, 0x00, 0x00])
+        # Flags (4 bytes, uint32): RME reads FLAG_STACKABLE so getCount() returns subtype and count is editable
+        otb_flags = FLAG_STACKABLE if 'Cumulative' in flags else 0
+        item_data.extend(struct.pack('<I', otb_flags))
         
         # ServerID attribute
         item_data.append(ITEM_ATTR_SERVERID)
