@@ -524,7 +524,7 @@ def generate_houses_xml(houses_path, houseareas_path, output_path):
 # Parse .mon files and build race lookup
 # ============================================================================
 def build_race_lookup(mon_dir):
-    """Build Race → Monster Name lookup from .mon files"""
+    """Build Race → Monster Name lookup from .mon files (using filename, not Name field)"""
     race_to_name = {}
     
     mon_dir = Path(mon_dir)
@@ -533,7 +533,9 @@ def build_race_lookup(mon_dir):
     
     for mon_file in mon_dir.glob("*.mon"):
         race_number = None
-        name = None
+        
+        # Use filename without .mon extension (this matches RME creatures.xml format)
+        monster_name = mon_file.stem  # e.g., "demonskeleton.mon" → "demonskeleton"
         
         with open(mon_file, 'r', encoding='latin-1', errors='ignore') as f:
             for line in f:
@@ -544,14 +546,9 @@ def build_race_lookup(mon_dir):
                         race_number = int(line.split('=')[1].split('#')[0].strip())
                     except:
                         pass
-                elif line.startswith('Name'):
-                    try:
-                        name = line.split('=', 1)[1].strip().strip('"')
-                    except:
-                        pass
                 
-                if race_number is not None and name is not None:
-                    race_to_name[race_number] = name
+                if race_number is not None:
+                    race_to_name[race_number] = monster_name
                     break
     
     return race_to_name
