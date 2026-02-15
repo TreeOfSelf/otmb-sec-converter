@@ -4,7 +4,7 @@ RME Configuration Generator for 7.70 CipSoft TypeIDs
 Generates ONLY RME configuration files (NOT map conversion)
 
 Input:  tibia-game folder
-Output: output/rme_config/data/770/ (items.otb, items.xml, creatures.xml, palettes)
+Output: output/rme_config/data/770-cipsoft/ (items.otb, items.xml, creatures.xml, palettes)
 
 For map conversion, use sec_to_otbm.py separately.
 """
@@ -1057,7 +1057,7 @@ def main():
         print("\nExample:")
         print("  python3 generate_rme_data.py ./tibia-game")
         print("\nThis will generate:")
-        print("  output/rme_config/data/770/  (RME config files)")
+        print("  output/rme_config/data/770-cipsoft/  (RME config files)")
         print("  output/rme_config/clients_xml_snippet.txt")
         sys.exit(1)
     
@@ -1080,7 +1080,7 @@ def main():
     print("=" * 70)
     print(f"\nInput:  {tibia_game_dir.absolute()}")
     
-    rme_config_dir = Path('output/rme_config/data/770')
+    rme_config_dir = Path('output/rme_config/data/770-cipsoft')
     rme_config_dir.mkdir(parents=True, exist_ok=True)
     
     print(f"Output: {rme_config_dir.absolute()}")
@@ -1136,7 +1136,7 @@ def main():
 <otb client="7.70-cipsoft" version="1" id="100"/>
 
 <!-- In the <clients> section, add: -->
-<client name="7.70 (CipSoft)" otb="7.70-cipsoft" visible="true" data_directory="770">
+<client name="7.70 (CipSoft)" otb="7.70-cipsoft" visible="true" data_directory="770-cipsoft">
     <otbm version="1"/>
     <extensions from="7.6" to="7.6"/>
     <data format="7.55" dat="0x439D5A33" spr="0x439852BE"/>
@@ -1152,7 +1152,7 @@ def main():
     print("=" * 70)
     print(f"\nOutput: {rme_config_dir.absolute()}")
     print(f"\n📋 Next steps:")
-    print(f"   1. Copy {rme_config_dir}/ to RME/data/770/")
+    print(f"   1. Copy {rme_config_dir}/ to RME/data/770-cipsoft/")
     print(f"   2. Add clients_xml_snippet.txt content to RME/data/clients.xml")
     print(f"   3. Copy Tibia.dat + Tibia.spr to RME client data directory")
     print()
