@@ -235,8 +235,8 @@ def generate_items_otb(items, output_path):
             item_group = ITEM_GROUP_GROUND
         elif 'Container' in flags or 'Chest' in flags:
             item_group = ITEM_GROUP_CONTAINER
-        elif 'Splash' in flags:
-            item_group = ITEM_GROUP_SPLASH
+        elif 'Splash' in flags or 'LiquidPool' in flags:
+            item_group = ITEM_GROUP_SPLASH  # LiquidPool = pool on ground; RME uses subtype (OTBM_ATTR_COUNT) as liquid
         elif 'LiquidContainer' in flags:
             item_group = ITEM_GROUP_FLUID  # RME uses subtype (OTBM_ATTR_COUNT) as liquid type for fluid containers
         elif 'Rune' in flags or 'MagicEffect' in flags:
@@ -336,7 +336,7 @@ def generate_items_xml(items, output_path):
             item_elem.set('type', 'key')
         elif 'Container' in flags or 'Chest' in flags:
             item_elem.set('type', 'container')
-        elif 'Splash' in flags or 'LiquidContainer' in flags or 'LiquidSource' in flags:
+        elif 'Splash' in flags or 'LiquidPool' in flags or 'LiquidContainer' in flags or 'LiquidSource' in flags:
             item_elem.set('type', 'splash')
         elif 'Teleport' in flags:
             item_elem.set('type', 'teleport')
