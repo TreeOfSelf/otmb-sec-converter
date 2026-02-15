@@ -131,8 +131,9 @@ def parse_objects_srv(objects_srv_path):
             
             name = ""
             flags = []
+            disguise_target = None
             
-            # Read next lines for Name and Flags
+            # Read next lines for Name, Flags, Attributes
             i += 1
             while i < len(lines):
                 line = lines[i].strip()
@@ -148,6 +149,18 @@ def parse_objects_srv(objects_srv_path):
                     flags_str = line.split('=', 1)[1].strip()
                     flags_str = flags_str.strip('{}')
                     flags = [f.strip() for f in flags_str.split(',') if f.strip()]
+                elif line.startswith('Attributes') and '=' in line:
+                    attrs_str = line.split('=', 1)[1].strip().strip('{}')
+                    for part in attrs_str.split(','):
+                        part = part.strip()
+                        if '=' in part and 'DisguiseTarget' in part:
+                            k, v = part.split('=', 1)
+                            if k.strip() == 'DisguiseTarget':
+                                try:
+                                    disguise_target = int(v.strip())
+                                except ValueError:
+                                    pass
+                                break
                 
                 i += 1
                 if not line or line == '':
@@ -156,7 +169,8 @@ def parse_objects_srv(objects_srv_path):
             items[type_id] = {
                 'type_id': type_id,
                 'name': name,
-                'flags': flags
+                'flags': flags,
+                'disguise_target': disguise_target,
             }
         else:
             i += 1
@@ -208,11 +222,11 @@ def generate_items_otb(items, output_path):
         if not item['name']:
             continue
         
-        # Determine item group
+        # Determine item group (Chest = container in CipSoft, e.g. bananapalm 2547)
         flags = item['flags']
         if 'Bank' in flags:
             item_group = ITEM_GROUP_GROUND
-        elif 'Container' in flags:
+        elif 'Container' in flags or 'Chest' in flags:
             item_group = ITEM_GROUP_CONTAINER
         elif 'Splash' in flags:
             item_group = ITEM_GROUP_SPLASH
@@ -228,15 +242,16 @@ def generate_items_otb(items, output_path):
         otb_flags = FLAG_STACKABLE if 'Cumulative' in flags else 0
         item_data.extend(struct.pack('<I', otb_flags))
         
-        # ServerID attribute
+        # ServerID attribute (map/server type id)
         item_data.append(ITEM_ATTR_SERVERID)
         item_data.extend(struct.pack('<H', 2))  # length
         item_data.extend(struct.pack('<H', type_id))
         
-        # ClientID attribute (same as ServerID in CipSoft mode)
+        # ClientID attribute (sprite id): use DisguiseTarget when set so RME shows correct graphic (e.g. 2547 bananapalm -> 3639)
+        client_id = item['disguise_target'] if item.get('disguise_target') is not None else type_id
         item_data.append(ITEM_ATTR_CLIENTID)
         item_data.extend(struct.pack('<H', 2))  # length
-        item_data.extend(struct.pack('<H', type_id))
+        item_data.extend(struct.pack('<H', client_id))
         
         # Name attribute
         name_bytes = item['name'].encode('latin-1', errors='ignore')
@@ -295,11 +310,11 @@ def generate_items_xml(items, output_path):
             item_elem.set('article', 'an')
             item_elem.set('name', item['name'][3:])
         
-        # Add type attributes based on flags
+        # Add type attributes based on flags (Chest = container in CipSoft)
         flags = item['flags']
         if 'Key' in flags:
             item_elem.set('type', 'key')
-        elif 'Container' in flags:
+        elif 'Container' in flags or 'Chest' in flags:
             item_elem.set('type', 'container')
         elif 'Splash' in flags or 'LiquidContainer' in flags or 'LiquidSource' in flags:
             item_elem.set('type', 'splash')
