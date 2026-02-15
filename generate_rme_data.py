@@ -22,6 +22,8 @@ ITEM_ATTR_SERVERID = 0x10
 ITEM_ATTR_CLIENTID = 0x11
 ITEM_ATTR_NAME = 0x12
 ITEM_ATTR_SPEED = 0x14
+# RME items.h ITEM_ATTR_MAXITEMS = 0x16; items.cpp loadFromOtb: volume (uint16) = number of container slots
+ITEM_ATTR_MAXITEMS = 0x16
 
 # RME items.h FLAG_* — OTB item node has uint32 flags after group byte; RME sets stackable from FLAG_STACKABLE
 FLAG_STACKABLE = 1 << 7
@@ -132,6 +134,7 @@ def parse_objects_srv(objects_srv_path):
             name = ""
             flags = []
             disguise_target = None
+            capacity = None
             
             # Read next lines for Name, Flags, Attributes
             i += 1
@@ -153,14 +156,17 @@ def parse_objects_srv(objects_srv_path):
                     attrs_str = line.split('=', 1)[1].strip().strip('{}')
                     for part in attrs_str.split(','):
                         part = part.strip()
-                        if '=' in part and 'DisguiseTarget' in part:
+                        if '=' in part:
                             k, v = part.split('=', 1)
-                            if k.strip() == 'DisguiseTarget':
-                                try:
-                                    disguise_target = int(v.strip())
-                                except ValueError:
-                                    pass
-                                break
+                            k = k.strip()
+                            try:
+                                val = int(v.strip())
+                            except ValueError:
+                                val = None
+                            if k == 'DisguiseTarget':
+                                disguise_target = val
+                            elif k == 'Capacity':
+                                capacity = val
                 
                 i += 1
                 if not line or line == '':
@@ -171,6 +177,7 @@ def parse_objects_srv(objects_srv_path):
                 'name': name,
                 'flags': flags,
                 'disguise_target': disguise_target,
+                'capacity': capacity,
             }
         else:
             i += 1
@@ -264,6 +271,17 @@ def generate_items_otb(items, output_path):
             item_data.append(ITEM_ATTR_SPEED)
             item_data.extend(struct.pack('<H', 2))  # length
             item_data.extend(struct.pack('<H', 150))  # speed value
+        
+        # Volume (slots) for Container and Chest — RME getVolume() returns g_items[id].volume; 0 = no slots shown
+        # Container: use Capacity from objects.srv or default 8. Chest: always 8 slots (no derivation).
+        if item_group == ITEM_GROUP_CONTAINER:
+            volume = item.get('capacity') if 'Container' in flags else None
+            if volume is None:
+                volume = 8
+            volume = max(1, min(0xFFFF, int(volume)))
+            item_data.append(ITEM_ATTR_MAXITEMS)
+            item_data.extend(struct.pack('<H', 2))  # length
+            item_data.extend(struct.pack('<H', volume))
         
         # Escape and write item node
         escaped = escape_otb_data(item_data)
