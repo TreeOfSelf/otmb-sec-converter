@@ -16,6 +16,7 @@ Output:
 Keeps original Tibia coordinates (map centered around 32000,32000).
 Map size: 65535x65535 (full OTBM size).
 """
+import re
 import sys
 from pathlib import Path
 from collections import defaultdict
@@ -32,6 +33,7 @@ OTBM_MAP_HEADER = 0x00
 OTBM_MAP_DATA = 0x02
 OTBM_TILE_AREA = 0x04
 OTBM_TILE = 0x05
+OTBM_HOUSETILE = 14   # RME: tile belongs to a house (followed by house_id u32)
 OTBM_ITEM = 0x06
 OTBM_ATTR_DESCRIPTION = 0x01
 OTBM_ATTR_EXT_SPAWN_FILE = 11   # RME: spawn filename in same dir as .otbm
@@ -384,8 +386,20 @@ def build_otbm_header(width, height):
     return writer.get_bytes()
 
 
-def convert_map_to_otbm(sectors, output_file, map_name, towns=None):
-    """Convert .sec files to OTBM format"""
+def build_house_positions(houses):
+    """Build (x,y,z) -> house_id lookup from parsed houses (with Fields/tiles)."""
+    pos_to_house = {}
+    for house in houses:
+        hid = house.get('id')
+        if hid is None:
+            continue
+        for (x, y, z) in house.get('tiles', []):
+            pos_to_house[(x, y, z)] = hid
+    return pos_to_house
+
+
+def convert_map_to_otbm(sectors, output_file, map_name, towns=None, house_positions=None):
+    """Convert .sec files to OTBM format. house_positions: dict (x,y,z) -> house_id for OTBM_HOUSETILE."""
     
     print("\n" + "="*70)
     print("CONVERTING MAP TO OTBM")
@@ -393,6 +407,8 @@ def convert_map_to_otbm(sectors, output_file, map_name, towns=None):
     
     if towns is None:
         towns = []
+    if house_positions is None:
+        house_positions = {}
     
     if not sectors:
         print("Error: No valid sectors found!")
@@ -437,11 +453,11 @@ def convert_map_to_otbm(sectors, output_file, map_name, towns=None):
             local_x = new_x & 0xFF
             local_y = new_y & 0xFF
             
-            areas[(area_x, area_y, z)].append({
-                'x': local_x,
-                'y': local_y,
-                'items': items
-            })
+            tile_record = {'x': local_x, 'y': local_y, 'items': items}
+            hid = house_positions.get((new_x, new_y, z))
+            if hid is not None:
+                tile_record['house_id'] = hid
+            areas[(area_x, area_y, z)].append(tile_record)
     
     print(f"  Writing {len(areas)} tile areas...")
     
@@ -461,9 +477,16 @@ def convert_map_to_otbm(sectors, output_file, map_name, towns=None):
             if not items:
                 continue
             
-            writer.start_node(OTBM_TILE)
-            writer.write_byte(tile['x'])
-            writer.write_byte(tile['y'])
+            house_id = tile.get('house_id')
+            if house_id is not None:
+                writer.start_node(OTBM_HOUSETILE)
+                writer.write_byte(tile['x'])
+                writer.write_byte(tile['y'])
+                writer.write_uint32(house_id)
+            else:
+                writer.start_node(OTBM_TILE)
+                writer.write_byte(tile['x'])
+                writer.write_byte(tile['y'])
             
             for item_data in items:
                 writer.start_node(OTBM_ITEM)
@@ -598,9 +621,13 @@ def parse_houses_dat(houses_path):
                     house['entryy'] = int(parts[1])
                     house['entryz'] = int(parts[2])
                 elif line.startswith('Fields'):
-                    fields_str = line.split('=')[1].strip()
-                    fields_str = fields_str.strip('{}')
-                    house['size'] = fields_str.count('[')
+                    fields_str = line.split('=', 1)[1].strip()
+                    # Fields = {[32258,32309,5],[32259,32309,5],...} -> list of (x,y,z)
+                    house['tiles'] = [
+                        (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                        for m in re.finditer(r'\[(\d+),(\d+),(\d+)\]', fields_str)
+                    ]
+                    house['size'] = len(house.get('tiles', []))
                 
                 i += 1
                 if not line:
@@ -1084,18 +1111,26 @@ def main():
     else:
         print(f"\n⚠ Warning: map.dat not found, map will have no towns")
     
-    # Convert map
+    # House positions for OTBM_HOUSETILE (so RME shows houses; house XML only updates metadata)
+    houses_dat = dat_dir / 'houses.dat'
+    houseareas_dat = dat_dir / 'houseareas.dat'
+    house_positions = {}
+    if houses_dat.exists():
+        houses_list = parse_houses_dat(dat_dir / 'houses.dat')
+        house_positions = build_house_positions(houses_list)
+        if house_positions:
+            print(f"\n✓ House tiles: {len(house_positions)} positions from houses.dat Fields")
+    
+    # Convert map (with house tiles so RME creates House objects)
     convert_map_to_otbm(
         sectors,
         output_dir / f'{output_name}.otbm',
         output_name,
-        towns=towns
+        towns=towns,
+        house_positions=house_positions
     )
     
-    # Generate houses XML
-    houses_dat = dat_dir / 'houses.dat'
-    houseareas_dat = dat_dir / 'houseareas.dat'
-    
+    # Generate houses XML (name, entry, rent, townid - applied to houses created from OTBM)
     if houses_dat.exists() and houseareas_dat.exists():
         generate_houses_xml(
             houses_dat,
