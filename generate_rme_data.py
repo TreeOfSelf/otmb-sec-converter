@@ -237,6 +237,8 @@ def generate_items_otb(items, output_path):
             item_group = ITEM_GROUP_CONTAINER
         elif 'Splash' in flags:
             item_group = ITEM_GROUP_SPLASH
+        elif 'LiquidContainer' in flags:
+            item_group = ITEM_GROUP_FLUID  # RME uses subtype (OTBM_ATTR_COUNT) as liquid type for fluid containers
         elif 'Rune' in flags or 'MagicEffect' in flags:
             item_group = ITEM_GROUP_RUNE
         else:
