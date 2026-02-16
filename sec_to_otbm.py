@@ -21,25 +21,142 @@ import sys
 from pathlib import Path
 from collections import defaultdict
 
+# First-seen logging: when we see a new type (charge, container, unknown key), log coords + .sec line
+# Attributes we skip when logging (we don't store them; server gives default)
+_DEBUG_LOG_SKIP = frozenset({'remainingexpiretime', 'savedexpiretime', 'remaininguses'})
+_debug_attributes_entries = []  # (type_name, context) for debug_attributes.log
+_LOGS_DIR = Path(__file__).resolve().parent / "logs"
+
+# All 18 server instance attributes (enums.hh INSTANCEATTRIBUTE, objects.cc InstanceAttributeNames):
+#   0 Content          -> structure (nested Content={}); not a key=value
+#   1 ChestQuestNumber -> actionid
+#   2 Amount           -> count
+#   3 KeyNumber        -> uniqueid  (key: UID = key number; RME shows both AID/UID; convention: key UID matches keyhole AID)
+#   4 KeyholeNumber    -> actionid  (keyhole: AID = lock number; server moveuse.cc compares KeyNumber == KeyholeNumber)
+#   5 Level            -> actionid (level doors)
+#   6 DoorQuestNumber  -> actionid
+#   7 DoorQuestValue   -> uniqueid
+#   8 Charges          -> rune charges
+#   9 String           -> text (OTBM_ATTR_TEXT)
+#  10 Editor           -> stored in item_data; not written to OTBM (RME OTBM_ATTR_DESC may differ)
+#  11 ContainerLiquidType -> liquid_type -> count (mapped)
+#  12 PoolLiquidType   -> liquid_type -> count (mapped)
+#  13 AbsTeleportDestination -> teleport_dest -> OTBM_ATTR_TELE_DEST
+#  14 Responsible      -> stored in item_data; not written to OTBM (no RME equivalent)
+#  15 RemainingExpireTime -> skipped (server default)
+#  16 SavedExpireTime  -> skipped (server default)
+#  17 RemainingUses    -> skipped (server default)
+KNOWN_ITEM_TYPES = frozenset({
+    "container", "string",
+    "amount", "poolliquidtype", "containerliquidtype",
+    "chestquestnumber", "doorquestnumber", "keyholenumber", "keynumber", "doorquestvalue",
+    "charges", "level", "remainingexpiretime", "savedexpiretime", "remaininguses",
+    "absteleportdestination",
+    "editor", "responsible",
+})
+
+
+def _log_new_type(type_name, context):
+    """Record occurrence for debug_attributes.log (all occurrences, grouped by type). Skips remainingexpiretime/savedexpiretime/remaininguses."""
+    if type_name in _DEBUG_LOG_SKIP:
+        return
+    _debug_attributes_entries.append((type_name, context))
+
 # ============================================================================
-# OTBM Constants
+# OTBM Constants - ALL from RME source (DO NOT GUESS)
+# ============================================================================
+# Copy-paste reference: RME/source/iomap_otbm.h, RME/source/tile.h
+# Root node: iomap_otbm.cpp saveMap() uses f.addNode(0) for root.
 # ============================================================================
 SECTOR_SIZE = 32
 NODE_ESC = 0xFD
 NODE_INIT = 0xFE
 NODE_TERM = 0xFF
 
+# Root (not in enum; RME writes 0)
 OTBM_MAP_HEADER = 0x00
-OTBM_MAP_DATA = 0x02
-OTBM_TILE_AREA = 0x04
-OTBM_TILE = 0x05
-OTBM_HOUSETILE = 14   # RME: tile belongs to a house (followed by house_id u32)
-OTBM_ITEM = 0x06
-OTBM_ATTR_DESCRIPTION = 0x01
-OTBM_ATTR_EXT_SPAWN_FILE = 11   # RME: spawn filename in same dir as .otbm
-OTBM_ATTR_EXT_HOUSE_FILE = 13   # RME: house filename in same dir as .otbm
-OTBM_TOWNS = 12
-OTBM_TOWN = 13
+
+# iomap_otbm.h enum OTBM_NodeTypes_t
+OTBM_ROOTV1 = 1
+OTBM_MAP_DATA = 2          # WE USE
+OTBM_ITEM_DEF = 3
+OTBM_TILE_AREA = 4         # WE USE
+OTBM_TILE = 5              # WE USE
+OTBM_ITEM = 6              # WE USE
+OTBM_TILE_SQUARE = 7
+OTBM_TILE_REF = 8
+OTBM_SPAWNS = 9
+OTBM_SPAWN_AREA = 10
+OTBM_MONSTER = 11
+OTBM_TOWNS = 12            # WE USE
+OTBM_TOWN = 13             # WE USE
+OTBM_HOUSETILE = 14        # WE USE
+OTBM_WAYPOINTS = 15
+OTBM_WAYPOINT = 16
+
+# iomap_otbm.h enum OTBM_ItemAttribute
+OTBM_ATTR_DESCRIPTION = 1      # WE USE (map desc + spawn/house filenames)
+OTBM_ATTR_EXT_FILE = 2
+OTBM_ATTR_TILE_FLAGS = 3       # WE USE
+OTBM_ATTR_ACTION_ID = 4        # WE USE
+OTBM_ATTR_UNIQUE_ID = 5        # WE USE
+OTBM_ATTR_TEXT = 6             # WE USE
+OTBM_ATTR_DESC = 7
+OTBM_ATTR_TELE_DEST = 8
+OTBM_ATTR_ITEM = 9
+OTBM_ATTR_DEPOT_ID = 10
+OTBM_ATTR_EXT_SPAWN_FILE = 11  # WE USE
+OTBM_ATTR_RUNE_CHARGES = 12
+OTBM_ATTR_EXT_HOUSE_FILE = 13  # WE USE
+OTBM_ATTR_HOUSEDOORID = 14     # RME: house doors only; we don't set from .sec (quest value → Unique ID)
+OTBM_ATTR_COUNT = 15           # WE USE
+
+# Server (Hardcore-Tibia-Server enums.hh LiquidType) -> RME (item.h SplashType)
+# So ContainerLiquidType=9 (Milk) writes RME 6 (LIQUID_MILK) and shows as Milk in editor.
+SERVER_LIQUID_TO_RME = {
+    0: 0,   # None
+    1: 1,   # Water
+    2: 15,  # Wine
+    3: 3,   # Beer
+    4: 19,  # Mud
+    5: 2,   # Blood
+    6: 4,   # Slime
+    7: 11,  # Oil
+    8: 13,  # Urine
+    9: 6,   # Milk
+    10: 7,  # Manafluid
+    11: 10, # Lifefluid
+    12: 5,  # Lemonade
+}
+# Server packs absolute teleport coords: UnpackAbsoluteCoordinate in moveuse.cc
+def _unpack_absolute_coordinate(packed):
+    """Packed (signed int) -> (x, y, z). Server: x = ((p>>18)&0x3FFF)+24576, y = ((p>>4)&0x3FFF)+24576, z = p&0xF."""
+    p = packed & 0xFFFFFFFF
+    x = ((p >> 18) & 0x3FFF) + 24576
+    y = ((p >> 4) & 0x3FFF) + 24576
+    z = p & 0xF
+    return (x, y, z)
+
+OTBM_ATTR_DURATION = 16
+OTBM_ATTR_DECAYING_STATE = 17
+OTBM_ATTR_WRITTENDATE = 18
+OTBM_ATTR_WRITTENBY = 19
+OTBM_ATTR_SLEEPERGUID = 20
+OTBM_ATTR_SLEEPSTART = 21
+OTBM_ATTR_CHARGES = 22         # WE USE
+OTBM_ATTR_EXT_SPAWN_NPC_FILE = 23
+OTBM_ATTR_PODIUMOUTFIT = 40
+OTBM_ATTR_TIER = 41
+OTBM_ATTR_ATTRIBUTE_MAP = 128
+
+# tile.h - map flags (stored in OTBM tile; first group only, not Internal/stat flags)
+TILESTATE_NONE = 0x0000
+TILESTATE_PROTECTIONZONE = 0x0001   # WE USE
+TILESTATE_DEPRECATED = 0x0002       # Reserved
+TILESTATE_NOPVP = 0x0004           # WE USE
+TILESTATE_NOLOGOUT = 0x0008        # WE USE
+TILESTATE_PVPZONE = 0x0010         # WE USE
+TILESTATE_REFRESH = 0x0020         # WE USE
 
 
 # ============================================================================
@@ -114,7 +231,7 @@ def parse_temples_from_moveuse(moveuse_path):
                 continue
             if in_section:
                 if line.startswith('BEGIN ') or line == 'END':
-                    break
+            break
                 # Line must have SetStart(Obj2,[x,y,z]) and "Home ... (1)" or "Home ... (?)"
                 if 'SetStart(Obj2,' not in line or '"Home ' not in line:
                     continue
@@ -232,7 +349,9 @@ def load_walkable_tiles_from_sectors(sectors):
     walkable_tiles = set()
     
     for (sx, sy, z), tiles in sectors.items():
-        for lx, ly, items in tiles:
+        for tile_entry in tiles:
+            lx, ly = tile_entry[0], tile_entry[1]
+            items = tile_entry[3] if len(tile_entry) == 4 else tile_entry[2]
             if items:  # Has items, likely has ground
                 abs_x = sx * SECTOR_SIZE + lx
                 abs_y = sy * SECTOR_SIZE + ly
@@ -244,8 +363,159 @@ def load_walkable_tiles_from_sectors(sectors):
 # ============================================================================
 # Parse .sec files
 # ============================================================================
+def _parse_sec_tile_flags(rest_before_content):
+    """Parse tile flags from the part before Content=. Returns uint32 flags for OTBM.
+    Real .sec examples: 'Refresh, ProtectionZone, Content={...}' (1023-0989-06.sec), etc. See docs/SEC_OTBM_DATA_CHECKLIST.md."""
+    flags = 0
+    s = rest_before_content
+    if 'ProtectionZone' in s:
+        flags |= TILESTATE_PROTECTIONZONE
+    if 'Refresh' in s:
+        flags |= TILESTATE_REFRESH
+    if 'NoPvp' in s:
+        flags |= TILESTATE_NOPVP
+    if 'NoLogout' in s:
+        flags |= TILESTATE_NOLOGOUT
+    if 'PvpZone' in s:
+        flags |= TILESTATE_PVPZONE
+    return flags
+
+
+def _parse_sec_content_list(content_str, context=None):
+    """
+    Parse Content={...} inner string into list of item specs.
+    Split by comma only at top level: not inside String="..." (respects escaped \\ and \\")
+    and not inside nested Content={} (brace-matched).
+    Container items have nested Content={...}; we parse recursively into item_data['content'].
+    context: optional dict with sec_file, lx, ly, line for debug_attributes.log (all occurrences, by type).
+    """
+    items = []
+    segments = []
+    i = 0
+    start = 0
+    in_string = False
+    escape = False
+    depth = 0
+    while i < len(content_str):
+        c = content_str[i]
+        if escape:
+            escape = False
+            i += 1
+            continue
+        if in_string:
+            if c == '\\':
+                escape = True
+            elif c == '"':
+                in_string = False
+            i += 1
+            continue
+        if content_str[i:i+7] == 'String="' and i + 7 <= len(content_str):
+            in_string = True
+            i += 7
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            segments.append(content_str[start:i].strip())
+            start = i + 1
+        i += 1
+    if start < len(content_str):
+        segments.append(content_str[start:].strip())
+    for spec in segments:
+        if spec:
+            _append_item_from_spec(items, spec, context)
+    return items
+
+
+def _append_item_from_spec(items, spec, context=None):
+    """Parse one item spec (e.g. '2816', '2816 String="text"', '2434 Content={3124}').
+    Nested Content={...} is parsed recursively and stored as item_data['content'].
+    When context is set, each attribute/container/string occurrence is recorded for logs/debug_attributes.log (sorted by type).
+    Order matters: extract Content={...} (brace-matched) BEFORE String="...", else the string truncation loses the closing }} and nested item ids (e.g. 2822) can be mis-parsed."""
+    string_val = None
+    # Extract nested Content={...} (brace-matched) FIRST so we don't truncate at String=" and lose the closing braces.
+    nested_content_str = None
+    if ' Content={' in spec:
+        start_marker = ' Content={'
+        pos = spec.index(start_marker)
+        inner_start = pos + len(start_marker)
+        depth = 1
+        i = inner_start
+        while i < len(spec) and depth > 0:
+            if spec[i] == '{':
+                depth += 1
+            elif spec[i] == '}':
+                depth -= 1
+            i += 1
+        nested_content_str = spec[inner_start:i - 1]
+        spec = spec[:pos].strip()
+        if context is not None:
+            _log_new_type("container", context)
+    if 'String="' in spec:
+        idx = spec.find('String="')
+        head = spec[:idx].strip().rstrip(',')
+        rest = spec[idx + 8:]
+        end = 0
+        i = 0
+        while i < len(rest):
+            if rest[i] == '\\':
+                i += 2
+                continue
+            if rest[i] == '"':
+                end = i
+                break
+            i += 1
+        string_val = rest[:end].replace('\\n', '\n').replace('\\"', '"')
+        spec = head
+    parts = spec.split()
+    if not parts:
+        return
+    try:
+        item_id = int(parts[0])
+    except (ValueError, IndexError):
+        return
+    item_data = {'id': item_id}
+    if string_val is not None:
+        item_data['text'] = string_val
+        if context is not None:
+            _log_new_type("string", context)
+    if nested_content_str is not None:
+        item_data['content'] = _parse_sec_content_list(nested_content_str, context)
+    for part in parts[1:]:
+        if '=' in part and 'String=' not in part and 'Content=' not in part:
+            key, value = part.split('=', 1)
+            key = key.lower()
+            if context is not None:
+                _log_new_type(key, context)
+            try:
+                v = int(value)
+            except ValueError:
+                continue
+            if key in ('chestquestnumber', 'doorquestnumber', 'keyholenumber', 'level'):
+                item_data['actionid'] = v  # level = required level for level doors (Gate of Expertise); RME has no Level attr, Action ID is conventional
+            elif key == 'keynumber':
+                item_data['uniqueid'] = v
+            elif key == 'doorquestvalue':
+                item_data['uniqueid'] = v  # RME disables "Door ID" for non-house tiles; Unique ID is visible for all doors
+            elif key == 'amount':
+                item_data['count'] = v
+            elif key in ('poolliquidtype', 'containerliquidtype'):
+                item_data['liquid_type'] = v
+            elif key == 'charges':
+                item_data['charges'] = v
+            elif key == 'absteleportdestination':
+                item_data['teleport_dest'] = _unpack_absolute_coordinate(v)  # RME OTBM_ATTR_TELE_DEST = (x, y, z)
+            elif key in ('remainingexpiretime', 'savedexpiretime', 'remaininguses'):
+                pass  # skip: server gives default (full TotalExpireTime / TotalUses) on load when omitted
+            else:
+                item_data[key] = v
+    items.append(item_data)
+
+
 def parse_sec_file(sec_file):
-    """Parse a single .sec file and return tiles with items"""
+    """Parse a single .sec file and return tiles with items and tile flags."""
     tiles = []
     
     with open(sec_file, 'r', encoding='latin-1', errors='ignore') as f:
@@ -262,50 +532,74 @@ def parse_sec_file(sec_file):
                 coords_part, rest = line.split(':', 1)
                 lx, ly = map(int, coords_part.strip().split('-'))
                 
-                if 'Refresh' in rest:
-                    rest = rest.replace('Refresh,', '').replace('Refresh', '')
-                
                 if 'Content={' not in rest:
                     continue
                 
+                rest_before_content = rest.split('Content={', 1)[0].strip()
+                map_flags = _parse_sec_tile_flags(rest_before_content)
+                
                 try:
                     content_part = rest.split('Content={', 1)[1]
-                    if '}' not in content_part:
+                    # Brace-matched extract: do not truncate at first '}' (nested Content={}).
+                    depth = 1
+                    i = 0
+                    in_str = False
+                    escape = False
+                    while i < len(content_part) and depth > 0:
+                        if escape:
+                            escape = False
+                            i += 1
                         continue
-                    content_str = content_part.split('}', 1)[0]
+                        if in_str:
+                            if content_part[i] == '\\':
+                                escape = True
+                            elif content_part[i] == '"':
+                                in_str = False
+                            i += 1
+                            continue
+                        if content_part[i:i+7] == 'String="' and i + 7 <= len(content_part):
+                            in_str = True
+                            i += 7
+                            continue
+                        if content_part[i] == '{':
+                            depth += 1
+                        elif content_part[i] == '}':
+                            depth -= 1
+                        i += 1
+                    if depth != 0:
+                        continue
+                    content_str = content_part[:i - 1]
                 except IndexError:
                     continue
                     
                 if not content_str.strip():
                     continue
                 
-                items = []
-                for item_str in content_str.split(','):
-                    item_str = item_str.strip()
-                    if not item_str:
-                        continue
-                    
-                    parts = item_str.split()
-                    
-                    try:
-                        item_id = int(parts[0])
+                # Absolute coords from sector filename (e.g. 0998-0990-05.sec) + tile (lx, ly)
+                try:
+                    stem = Path(sec_file).stem
+                    parts = stem.split("-")
+                    if len(parts) >= 3:
+                        sx, sy, sz = int(parts[0]), int(parts[1]), int(parts[2])
+                        abs_x = sx * SECTOR_SIZE + lx
+                        abs_y = sy * SECTOR_SIZE + ly
+                    else:
+                        abs_x = abs_y = sz = None
                     except (ValueError, IndexError):
-                        continue
-                    
-                    item_data = {'id': item_id}
-                    
-                    for part in parts[1:]:
-                        if '=' in part:
-                            key, value = part.split('=', 1)
-                            try:
-                                item_data[key.lower()] = int(value)
-                            except ValueError:
-                                pass
-                    
-                    items.append(item_data)
+                    abs_x = abs_y = sz = None
+                context = {
+                    "sec_file": str(sec_file),
+                    "lx": lx,
+                    "ly": ly,
+                    "x": abs_x,
+                    "y": abs_y,
+                    "z": sz,
+                    "line": line,
+                }
+                items = _parse_sec_content_list(content_str, context)
                 
                 if items:
-                    tiles.append((lx, ly, items))
+                    tiles.append((lx, ly, map_flags, items))
                     
             except (ValueError, IndexError):
                 continue
@@ -313,10 +607,38 @@ def parse_sec_file(sec_file):
     return tiles
 
 
+def _init_debug_attributes_log():
+    """Clear debug attribute entries for this run."""
+    global _debug_attributes_entries
+    _debug_attributes_entries = []
+
+
+def _write_debug_attributes_log():
+    """Write all collected attribute occurrences to logs/debug_attributes.log, sorted by type."""
+    if not _debug_attributes_entries:
+        return
+    _LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = _LOGS_DIR / "debug_attributes.log"
+    lines = []
+    for type_name, context in sorted(_debug_attributes_entries, key=lambda e: e[0]):
+        x = context.get("x")
+        y = context.get("y")
+        z = context.get("z")
+        coord_str = f"X={x} Y={y} Z={z}" if x is not None and y is not None and z is not None else "X=? Y=? Z=?"
+        sec_file = context.get("sec_file", "?")
+        lx = context.get("lx", "?")
+        ly = context.get("ly", "?")
+        line = context.get("line", "")
+        lines.append(f"{type_name} | {coord_str} | {sec_file} | tile {lx}-{ly} | {line}\n")
+    with open(log_file, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
 def load_all_sectors(sec_dir):
     """Load all .sec files and organize by sector"""
     sec_dir = Path(sec_dir)
     sectors = defaultdict(list)
+    _init_debug_attributes_log()
     
     print(f"\nScanning for .sec files in {sec_dir}...")
     sec_files = sorted(sec_dir.glob("*.sec"))
@@ -359,7 +681,9 @@ def calculate_bounds(sectors, offset_x=0, offset_y=0):
     max_x = max_y = float('-inf')
 
     for (sx, sy, _z), tiles in sectors.items():
-        for lx, ly, _items in tiles:
+        for tile_entry in tiles:
+            lx, ly = tile_entry[0], tile_entry[1]
+            _items = tile_entry[3] if len(tile_entry) == 4 else tile_entry[2]
             abs_x = sx * SECTOR_SIZE + lx
             abs_y = sy * SECTOR_SIZE + ly
             new_x = abs_x - offset_x
@@ -375,10 +699,10 @@ def calculate_bounds(sectors, offset_x=0, offset_y=0):
 
 
 def build_otbm_header(width, height):
-    """Build OTBM header for CipSoft 7.7 (OTB ID 100)"""
+    """Build OTBM header for CipSoft 7.7 (OTB ID 100). MAP_OTBM_2 (1): count via OTBM_ATTR_COUNT."""
     writer = OTBMWriter()
     writer.start_node(OTBM_MAP_HEADER)
-    writer.write_uint32(1)    # OTBM version
+    writer.write_uint32(1)    # MAP_OTBM_2 = 1: item count is OTBM_ATTR_COUNT (15) + byte
     writer.write_uint16(width)
     writer.write_uint16(height)
     writer.write_uint32(1)    # OTB major version
@@ -396,6 +720,46 @@ def build_house_positions(houses):
         for (x, y, z) in house.get('tiles', []):
             pos_to_house[(x, y, z)] = hid
     return pos_to_house
+
+
+def _write_otbm_item_recursive(writer, item_data, counters):
+    """Write one OTBM_ITEM (id + attributes), then recursively write child items (containers).
+    RME (iomap_otbm.cpp): MAP_OTBM_2 reads count from OTBM_ATTR_COUNT; getCount() returns subtype only if item is stackable (items.otb)."""
+    writer.start_node(OTBM_ITEM)
+    writer.write_uint16(item_data['id'])
+    if item_data.get('liquid_type') is not None:
+        writer.write_byte(OTBM_ATTR_COUNT)
+        writer.write_byte(SERVER_LIQUID_TO_RME.get(item_data['liquid_type'], item_data['liquid_type']))
+    elif item_data.get('count') is not None:
+        writer.write_byte(OTBM_ATTR_COUNT)
+        writer.write_byte(min(255, max(0, item_data['count'])))
+    if item_data.get('actionid') is not None:
+        writer.write_byte(OTBM_ATTR_ACTION_ID)
+        writer.write_uint16(item_data['actionid'])
+        counters['n_action_id'] += 1
+    if item_data.get('uniqueid') is not None:
+        writer.write_byte(OTBM_ATTR_UNIQUE_ID)
+        writer.write_uint16(item_data['uniqueid'])
+    if item_data.get('charges') is not None:
+        writer.write_byte(OTBM_ATTR_CHARGES)
+        writer.write_uint16(min(65535, max(0, item_data['charges'])))
+    if item_data.get('text'):
+        writer.write_byte(OTBM_ATTR_TEXT)
+        writer.write_string(item_data['text'])
+        counters['n_text'] += 1
+    if item_data.get('teleport_dest'):
+        tx, ty, tz = item_data['teleport_dest']
+        writer.write_byte(OTBM_ATTR_TELE_DEST)
+        writer.write_uint16(min(65535, max(0, tx)))
+        writer.write_uint16(min(65535, max(0, ty)))
+        writer.write_byte(min(15, max(0, tz)))
+    content_list = item_data.get('content') or item_data.get('contents') or []
+    for child in content_list:
+        _write_otbm_item_recursive(writer, child, counters)
+    if content_list:
+        counters['container_children'] = counters.get('container_children', 0) + len(content_list)
+    writer.end_node()
+    counters['total_items'] += 1
 
 
 def convert_map_to_otbm(sectors, output_file, map_name, towns=None, house_positions=None):
@@ -437,10 +801,15 @@ def convert_map_to_otbm(sectors, output_file, map_name, towns=None, house_positi
     writer.write_string(f"{map_name}-spawn.xml")
     writer.write_byte(OTBM_ATTR_EXT_HOUSE_FILE)
     writer.write_string(f"{map_name}-house.xml")
-
+    
     areas = defaultdict(list)
     for (sx, sy, z), tiles in sectors.items():
-        for lx, ly, items in tiles:
+        for tile_entry in tiles:
+            if len(tile_entry) == 4:
+                lx, ly, map_flags, items = tile_entry
+            else:
+                lx, ly, items = tile_entry[0], tile_entry[1], tile_entry[2]
+                map_flags = 0
             abs_x = sx * SECTOR_SIZE + lx
             abs_y = sy * SECTOR_SIZE + ly
             
@@ -453,7 +822,7 @@ def convert_map_to_otbm(sectors, output_file, map_name, towns=None, house_positi
             local_x = new_x & 0xFF
             local_y = new_y & 0xFF
             
-            tile_record = {'x': local_x, 'y': local_y, 'items': items}
+            tile_record = {'x': local_x, 'y': local_y, 'items': items, 'map_flags': map_flags}
             hid = house_positions.get((new_x, new_y, z))
             if hid is not None:
                 tile_record['house_id'] = hid
@@ -462,7 +831,7 @@ def convert_map_to_otbm(sectors, output_file, map_name, towns=None, house_positi
     print(f"  Writing {len(areas)} tile areas...")
     
     total_tiles = 0
-    total_items = 0
+    counters = {'n_action_id': 0, 'n_text': 0, 'total_items': 0, 'container_children': 0}
     
     for idx, ((bx, by, z), tiles) in enumerate(sorted(areas.items())):
         writer.start_node(OTBM_TILE_AREA)
@@ -484,15 +853,17 @@ def convert_map_to_otbm(sectors, output_file, map_name, towns=None, house_positi
                 writer.write_byte(tile['y'])
                 writer.write_uint32(house_id)
             else:
-                writer.start_node(OTBM_TILE)
-                writer.write_byte(tile['x'])
-                writer.write_byte(tile['y'])
+            writer.start_node(OTBM_TILE)
+            writer.write_byte(tile['x'])
+            writer.write_byte(tile['y'])
             
+            if tile.get('map_flags'):
+                writer.write_byte(OTBM_ATTR_TILE_FLAGS)
+                writer.write_uint32(tile['map_flags'])
+            
+            # RME draws first item = bottom of stack, last = top. .sec lists bottom-first (ground, then furniture, then items on top), so use same order.
             for item_data in items:
-                writer.start_node(OTBM_ITEM)
-                writer.write_uint16(item_data['id'])
-                writer.end_node()
-                total_items += 1
+                _write_otbm_item_recursive(writer, item_data, counters)
             
             writer.end_node()
         
@@ -523,8 +894,20 @@ def convert_map_to_otbm(sectors, output_file, map_name, towns=None, house_positi
         f.write(b'OTBM')
         f.write(writer.get_bytes())
     
+    n_action_id = counters['n_action_id']
+    n_text = counters['n_text']
+    total_items = counters['total_items']
+    n_container_children = counters.get('container_children', 0)
     print(f"\n✓ Map generated: {output_file}")
     print(f"  Tiles: {total_tiles:,}, Items: {total_items:,}")
+    if n_container_children:
+        print(f"  Container contents written: {n_container_children:,} child items (e.g. banana in bananapalm)")
+    if n_action_id or n_text:
+        print(f"  Item attributes written: action_id={n_action_id:,}, text={n_text:,}")
+        if n_action_id:
+            print(f"  → In RME: action/unique IDs show when items.otb marks those item IDs as Door or Teleport (isDoor/isTeleport).")
+    if total_items and n_action_id == 0:
+        print(f"  (No action_id in output; RME only shows them when items.otb marks the item as Door/Teleport)")
 
 
 # ============================================================================
@@ -1163,6 +1546,9 @@ def main():
         print(f"  → {output_name}-house.xml")
     if monster_db.exists():
         print(f"  → {output_name}-spawn.xml")
+    _write_debug_attributes_log()
+    if _debug_attributes_entries:
+        print(f"  → logs/debug_attributes.log ({len(_debug_attributes_entries)} attribute occurrences, by type)")
     print()
 
 
