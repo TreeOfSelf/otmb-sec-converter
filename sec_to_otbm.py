@@ -339,24 +339,51 @@ def parse_map_dat(map_dat_path, temple_positions=None):
 # ============================================================================
 # Map walkability checking
 # ============================================================================
-def load_walkable_tiles_from_sectors(sectors):
+def load_unpass_type_ids(objects_srv_path):
+    """Parse objects.srv; return set of type_id that have Unpass in Flags (walls, etc.)."""
+    path = Path(objects_srv_path)
+    if not path.exists():
+        return set()
+    unpass = set()
+    current_type_id = None
+    with open(path, 'r', encoding='latin-1', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith('TypeID'):
+                match = re.search(r'TypeID\s*=\s*(\d+)', line)
+                if match:
+                    current_type_id = int(match.group(1))
+            elif current_type_id is not None and line.startswith('Flags'):
+                match = re.search(r'Flags\s*=\s*\{([^}]*)\}', line)
+                if match:
+                    flags_str = match.group(1)
+                    flags = {s.strip().lower() for s in flags_str.split(',')}
+                    if 'unpass' in flags:
+                        unpass.add(current_type_id)
+                current_type_id = None
+    return unpass
+
+
+def load_walkable_tiles_from_sectors(sectors, unpass_type_ids=None):
     """
     Build a set of walkable tile positions from the sector data.
-    A tile is walkable if it has ground items (items that can be walked on).
-    This is a simplified check - in reality we'd need item type data.
-    For now, we assume any tile with items is potentially walkable.
+    A tile is walkable if it has items and no item on the tile has Unpass (objects.srv Flags).
+    If unpass_type_ids is None, any tile with items is considered potentially walkable (legacy).
     """
     walkable_tiles = set()
-    
     for (sx, sy, z), tiles in sectors.items():
         for tile_entry in tiles:
             lx, ly = tile_entry[0], tile_entry[1]
             items = tile_entry[3] if len(tile_entry) == 4 else tile_entry[2]
-            if items:  # Has items, likely has ground
-                abs_x = sx * SECTOR_SIZE + lx
-                abs_y = sy * SECTOR_SIZE + ly
-                walkable_tiles.add((abs_x, abs_y, z))
-    
+            if not items:
+                continue
+            if unpass_type_ids is not None:
+                item_ids = {item.get('id') for item in items if item.get('id') is not None}
+                if item_ids & unpass_type_ids:
+                    continue  # tile has Unpass (e.g. wall) -> not walkable
+            abs_x = sx * SECTOR_SIZE + lx
+            abs_y = sy * SECTOR_SIZE + ly
+            walkable_tiles.add((abs_x, abs_y, z))
     return walkable_tiles
 
 
@@ -1308,8 +1335,25 @@ def parse_npc_files(npc_dir):
     return npc_spawns, npc_creatures
 
 
-def generate_spawns_xml(monster_db_path, mon_dir, npc_dir, output_path, sectors):
-    """Generate map-spawn.xml from monster.db and .npc files, checking walkability"""
+def _write_debug_spawn_shifts_log(shift_entries, log_path=None):
+    """Write spawn shift records to logs/debug_spawn_shifts.log (plain text, one per line, tab-separated)."""
+    if not shift_entries:
+        return
+    log_path = log_path or (_LOGS_DIR / "debug_spawn_shifts.log")
+    _LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    header = "type\tname\tfrom_x\tfrom_y\tfrom_z\tto_x\tto_y\tto_z\treason"
+    lines = [
+        f"{e['type']}\t{e['name']}\t{e['from_x']}\t{e['from_y']}\t{e['from_z']}\t{e['to_x']}\t{e['to_y']}\t{e['to_z']}\t{e['reason']}"
+        for e in shift_entries
+    ]
+    with open(log_path, 'w', encoding='utf-8') as f:
+        f.write(header + '\n' + '\n'.join(lines))
+
+
+def generate_spawns_xml(monster_db_path, mon_dir, npc_dir, output_path, sectors, objects_srv_path=None):
+    """Generate map-spawn.xml from monster.db and .npc files, checking walkability.
+    Spawn center is only nudged when another SPAWN CENTER is there; spawn centers may sit on monster tiles.
+    Walkable = tiles with no Unpass item (objects.srv); nudged centers land on walkable tiles only."""
     
     print("\n" + "="*70)
     print("GENERATING SPAWNS XML")
@@ -1324,14 +1368,19 @@ def generate_spawns_xml(monster_db_path, mon_dir, npc_dir, output_path, sectors)
     npc_spawns, npc_creatures = parse_npc_files(npc_dir)
     print(f"Found {len(npc_spawns)} NPC spawns")
     
-    # Build walkable tile set from map
+    unpass_type_ids = load_unpass_type_ids(objects_srv_path) if objects_srv_path else None
+    if unpass_type_ids is not None:
+        print(f"  Unpass types from objects.srv: {len(unpass_type_ids)} (excluded from walkable)")
+    
+    # Build walkable tile set: tiles with items and no Unpass item on them
     print("Building walkable tile map from sectors...")
-    walkable_tiles = load_walkable_tiles_from_sectors(sectors)
+    walkable_tiles = load_walkable_tiles_from_sectors(sectors, unpass_type_ids=unpass_type_ids)
     print(f"  Found {len(walkable_tiles)} walkable tiles")
     
-    # Track globally used tiles to avoid conflicts
+    # Track: used tiles = where a creature stands; spawn centers = where a spawn center is (no two centers on same tile)
     global_used_tiles = set()
-    global_spawn_centers = set()  # Track spawn centers to avoid duplicates
+    global_spawn_centers = set()
+    shift_entries = []  # for logs/debug_spawn_shifts.log
     
     xml_lines = ['<?xml version="1.0"?>']
     xml_lines.append('<spawns>')
@@ -1352,7 +1401,31 @@ def generate_spawns_xml(monster_db_path, mon_dir, npc_dir, output_path, sectors)
         z = spawn['z']
         amount = spawn['amount']
         
-        # Mark this spawn center as used
+        # Nudge spawn center ONLY when another spawn center is there; nudged center must be walkable (no Unpass)
+        if (center_x, center_y, z) in global_spawn_centers:
+            orig_x, orig_y = center_x, center_y
+            center_found = False
+            for radius in range(1, 25):
+                if center_found:
+                    break
+                for dx in range(-radius, radius + 1):
+                    for dy in range(-radius, radius + 1):
+                        if abs(dx) == radius or abs(dy) == radius:
+                            nx, ny = orig_x + dx, orig_y + dy
+                            tile = (nx, ny, z)
+                            if tile not in global_spawn_centers and tile in walkable_tiles:
+                                center_x, center_y = nx, ny
+                                center_found = True
+                                shift_entries.append({
+                                    'type': 'monster', 'name': monster_name,
+                                    'from_x': orig_x, 'from_y': orig_y, 'from_z': z,
+                                    'to_x': center_x, 'to_y': center_y, 'to_z': z,
+                                    'reason': 'spawn_center_collision',
+                                })
+                                break
+                    if center_found:
+                        break
+        
         global_spawn_centers.add((center_x, center_y, z))
         
         # Place creatures and track their offsets
@@ -1421,88 +1494,95 @@ def generate_spawns_xml(monster_db_path, mon_dir, npc_dir, output_path, sectors)
         
         xml_lines.append('\t</spawn>')
     
-    # Add NPC spawns (with smart offset search to avoid duplicate centers)
+    # Add NPC spawns. Spawn center only blocked by other spawn centers; NPC standing tile must be walkable+unused.
     npc_count = 0
     for npc in npc_spawns:
         original_center_x = npc['x']
         original_center_y = npc['y']
         z = npc['z']
         
-        # Find a spawn center that isn't already used
         center_x = original_center_x
         center_y = original_center_y
         center_found = False
         
-        # Check if original center is available
+        # Accept center if not another spawn center (we don't care about solid/wall when just placing)
         if (center_x, center_y, z) not in global_spawn_centers:
-            # Check if we can place NPC at this center
-            tile = (center_x, center_y, z)
-            if tile in walkable_tiles and tile not in global_used_tiles:
-                global_spawn_centers.add((center_x, center_y, z))
-                global_used_tiles.add(tile)
-                center_found = True
-                final_dx = 0
-                final_dy = 0
-        
-        if not center_found:
-            # Try offsetting the spawn CENTER (not just the creature)
-            # Try cardinal directions: +X, -X, +Y, -Y
+            center_found = True
+            global_spawn_centers.add((center_x, center_y, z))
+        else:
+            # Nudge ONLY on overlap; then we care: new center must be walkable (no Unpass)
             for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
-                new_center_x = original_center_x + dx
-                new_center_y = original_center_y + dy
-                
-                if (new_center_x, new_center_y, z) not in global_spawn_centers:
-                    # Can we place NPC at this new center?
-                    tile = (new_center_x, new_center_y, z)
-                    if tile in walkable_tiles and tile not in global_used_tiles:
-                        center_x = new_center_x
-                        center_y = new_center_y
-                        global_spawn_centers.add((center_x, center_y, z))
-                        global_used_tiles.add(tile)
-                        center_found = True
-                        final_dx = 0
-                        final_dy = 0
-                        break
-        
-        if not center_found:
-            # Spiral search for a completely new center position
-            for radius in range(2, 10):
-                if center_found:
+                nx, ny = original_center_x + dx, original_center_y + dy
+                tile = (nx, ny, z)
+                if tile not in global_spawn_centers and tile in walkable_tiles:
+                    center_x, center_y = nx, ny
+                    center_found = True
+                    global_spawn_centers.add((center_x, center_y, z))
+                    shift_entries.append({
+                        'type': 'npc', 'name': npc['name'],
+                        'from_x': original_center_x, 'from_y': original_center_y, 'from_z': z,
+                        'to_x': center_x, 'to_y': center_y, 'to_z': z,
+                        'reason': 'spawn_center_collision',
+                    })
                     break
-                for dx in range(-radius, radius + 1):
-                    for dy in range(-radius, radius + 1):
-                        if abs(dx) == radius or abs(dy) == radius:
-                            new_center_x = original_center_x + dx
-                            new_center_y = original_center_y + dy
-                            
-                            if (new_center_x, new_center_y, z) not in global_spawn_centers:
-                                tile = (new_center_x, new_center_y, z)
-                                if tile in walkable_tiles and tile not in global_used_tiles:
-                                    center_x = new_center_x
-                                    center_y = new_center_y
-                                    global_spawn_centers.add((center_x, center_y, z))
-                                    global_used_tiles.add(tile)
+            if not center_found:
+                for radius in range(2, 10):
+                    if center_found:
+                        break
+                    for dx in range(-radius, radius + 1):
+                        for dy in range(-radius, radius + 1):
+                            if abs(dx) == radius or abs(dy) == radius:
+                                nx, ny = original_center_x + dx, original_center_y + dy
+                                tile = (nx, ny, z)
+                                if tile not in global_spawn_centers and tile in walkable_tiles:
+                                    center_x, center_y = nx, ny
                                     center_found = True
-                                    final_dx = 0
-                                    final_dy = 0
+                                    global_spawn_centers.add((center_x, center_y, z))
+                                    shift_entries.append({
+                                        'type': 'npc', 'name': npc['name'],
+                                        'from_x': original_center_x, 'from_y': original_center_y, 'from_z': z,
+                                        'to_x': center_x, 'to_y': center_y, 'to_z': z,
+                                        'reason': 'spawn_center_collision',
+                                    })
                                     break
                         if center_found:
                             break
-                    if center_found:
-                        break
         
-        if center_found:
-            xml_lines.append(
-                f'\t<spawn centerx="{center_x}" centery="{center_y}" '
-                f'centerz="{z}" radius="1">'
-            )
-            xml_lines.append(
-                f'\t\t<npc name="{npc["name"]}" x="{final_dx}" y="{final_dy}" z="{z}" spawntime="60"/>'
-            )
-            xml_lines.append('\t</spawn>')
-            npc_count += 1
-        else:
+        if not center_found:
             print(f"  ⚠ Warning: Could not place NPC '{npc['name']}' near ({original_center_x}, {original_center_y}, {z}) - no available spawn centers")
+            continue
+        
+        # Find where NPC stands: first walkable+unused tile from center outward (spawn center may be on monster)
+        final_dx, final_dy = 0, 0
+        npc_tile_found = False
+        for radius in range(0, 15):
+            if npc_tile_found:
+                break
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    if radius == 0 or abs(dx) == radius or abs(dy) == radius:
+                        tile = (center_x + dx, center_y + dy, z)
+                        if tile in walkable_tiles and tile not in global_used_tiles:
+                            final_dx, final_dy = dx, dy
+                            global_used_tiles.add(tile)
+                            npc_tile_found = True
+                            break
+                if npc_tile_found:
+                    break
+        
+        if not npc_tile_found:
+            print(f"  ⚠ Warning: No walkable tile for NPC '{npc['name']}' near center ({center_x}, {center_y}, {z})")
+            continue
+        
+        xml_lines.append(
+            f'\t<spawn centerx="{center_x}" centery="{center_y}" '
+            f'centerz="{z}" radius="1">'
+        )
+        xml_lines.append(
+            f'\t\t<npc name="{npc["name"]}" x="{final_dx}" y="{final_dy}" z="{z}" spawntime="60"/>'
+        )
+        xml_lines.append('\t</spawn>')
+        npc_count += 1
     
     xml_lines.append('</spawns>')
     
@@ -1510,8 +1590,12 @@ def generate_spawns_xml(monster_db_path, mon_dir, npc_dir, output_path, sectors)
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(xml_lines))
     
+    _write_debug_spawn_shifts_log(shift_entries)
+    
     print(f"✓ Spawns XML generated: {total_creatures} monsters, {npc_count} NPCs")
     print(f"  ✓ All creatures placed on walkable tiles")
+    if shift_entries:
+        print(f"  → logs/debug_spawn_shifts.log ({len(shift_entries)} center shifts)")
     if skipped_unwalkable > 0:
         print(f"  ℹ Skipped {skipped_unwalkable} non-walkable positions during placement")
 
@@ -1628,7 +1712,8 @@ def main():
             mon_dir,
             npc_dir,
             output_dir / f'{output_name}-spawn.xml',
-            sectors
+            sectors,
+            objects_srv_path=objects_srv,
         )
     else:
         print(f"\n⚠ Skipping spawns (missing {monster_db})")

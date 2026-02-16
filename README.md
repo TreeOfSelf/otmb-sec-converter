@@ -17,8 +17,4 @@ Convert Open Tibia Map Binary to and from Official CipSoft Sector Map files
 ### Omitted RemainingUses on ice rapier (3284)
 `No sensible field & server gives default`
 
-Prefer no wall when shifting spawns
-
-Liquids seem wrong sometimes 
-
 parse moveuse.dat (whats the different between those and absteleportdestination ?)
