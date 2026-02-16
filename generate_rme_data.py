@@ -277,11 +277,15 @@ def generate_items_otb(items, output_path):
             item_data.extend(struct.pack('<H', 150))  # speed value
         
         # Volume (slots) for Container and Chest — RME getVolume() returns g_items[id].volume; 0 = no slots shown
-        # Container: use Capacity from objects.srv or default 8. Chest: always 8 slots (no derivation).
+        # Chest-only (map chests): server has no Capacity; .sec only ever 0–1 item in chest Content → 1 slot.
+        # Container: use Capacity from objects.srv or default 8.
         if item_group == ITEM_GROUP_CONTAINER:
-            volume = item.get('capacity') if 'Container' in flags else None
-            if volume is None:
-                volume = 8
+            if 'Chest' in flags and 'Container' not in flags:
+                volume = 1
+            else:
+                volume = item.get('capacity') if 'Container' in flags else None
+                if volume is None:
+                    volume = 8
             volume = max(1, min(0xFFFF, int(volume)))
             item_data.append(ITEM_ATTR_MAXITEMS)
             item_data.extend(struct.pack('<H', 2))  # length
