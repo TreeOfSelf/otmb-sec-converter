@@ -231,7 +231,7 @@ def parse_temples_from_moveuse(moveuse_path):
                 continue
             if in_section:
                 if line.startswith('BEGIN ') or line == 'END':
-            break
+                    break
                 # Line must have SetStart(Obj2,[x,y,z]) and "Home ... (1)" or "Home ... (?)"
                 if 'SetStart(Obj2,' not in line or '"Home ' not in line:
                     continue
@@ -409,15 +409,15 @@ def _parse_sec_content_list(content_str, context=None):
                 in_string = False
             i += 1
             continue
-        if content_str[i:i+7] == 'String="' and i + 7 <= len(content_str):
+        if content_str[i:i+8] == 'String="' and i + 8 <= len(content_str):
             in_string = True
-            i += 7
+            i += 8
             continue
         if c == '{':
             depth += 1
         elif c == '}':
             depth -= 1
-        elif c == ',' and depth == 0:
+        elif c == ',' and depth == 0 and not in_string:
             segments.append(content_str[start:i].strip())
             start = i + 1
         i += 1
@@ -461,12 +461,19 @@ def _append_item_from_spec(items, spec, context=None):
         i = 0
         while i < len(rest):
             if rest[i] == '\\':
+                # Include escaped pair in content; if string ends with \", we never see a bare " so set end here
+                end = i + 2
                 i += 2
                 continue
             if rest[i] == '"':
-                end = i
-                break
+                # Only treat as closing delimiter when not escaped (\" is part of content)
+                if i == 0 or rest[i - 1] != '\\':
+                    end = i
+                    break
             i += 1
+        # If we consumed rest without finding a closing " (e.g. segment ended with \"), use all of rest
+        if end == 0 and i > 0:
+            end = i
         string_val = rest[:end].replace('\\n', '\n').replace('\\"', '"')
         spec = head
     parts = spec.split()
@@ -549,7 +556,7 @@ def parse_sec_file(sec_file):
                         if escape:
                             escape = False
                             i += 1
-                        continue
+                            continue
                         if in_str:
                             if content_part[i] == '\\':
                                 escape = True
@@ -557,9 +564,9 @@ def parse_sec_file(sec_file):
                                 in_str = False
                             i += 1
                             continue
-                        if content_part[i:i+7] == 'String="' and i + 7 <= len(content_part):
+                        if content_part[i:i+8] == 'String="' and i + 8 <= len(content_part):
                             in_str = True
-                            i += 7
+                            i += 8
                             continue
                         if content_part[i] == '{':
                             depth += 1
@@ -585,8 +592,9 @@ def parse_sec_file(sec_file):
                         abs_y = sy * SECTOR_SIZE + ly
                     else:
                         abs_x = abs_y = sz = None
-                    except (ValueError, IndexError):
+                except (ValueError, IndexError):
                     abs_x = abs_y = sz = None
+                
                 context = {
                     "sec_file": str(sec_file),
                     "lx": lx,
@@ -810,6 +818,7 @@ def convert_map_to_otbm(sectors, output_file, map_name, towns=None, house_positi
             else:
                 lx, ly, items = tile_entry[0], tile_entry[1], tile_entry[2]
                 map_flags = 0
+            
             abs_x = sx * SECTOR_SIZE + lx
             abs_y = sy * SECTOR_SIZE + ly
             
@@ -853,9 +862,9 @@ def convert_map_to_otbm(sectors, output_file, map_name, towns=None, house_positi
                 writer.write_byte(tile['y'])
                 writer.write_uint32(house_id)
             else:
-            writer.start_node(OTBM_TILE)
-            writer.write_byte(tile['x'])
-            writer.write_byte(tile['y'])
+                writer.start_node(OTBM_TILE)
+                writer.write_byte(tile['x'])
+                writer.write_byte(tile['y'])
             
             if tile.get('map_flags'):
                 writer.write_byte(OTBM_ATTR_TILE_FLAGS)
