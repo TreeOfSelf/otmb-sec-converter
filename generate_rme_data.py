@@ -27,6 +27,11 @@ ITEM_ATTR_MAXITEMS = 0x16
 
 # RME items.h FLAG_* — OTB item node has uint32 flags after group byte; RME sets stackable from FLAG_STACKABLE
 FLAG_STACKABLE = 1 << 7
+# RME: FLAG_ALWAYSONTOP sets alwaysOnBottom = true (legacy naming). Used for Clip/Bottom/Top/Height (see FLAG_ATTRIBUTE_MAPPING.md).
+FLAG_ALWAYSONTOP = 1 << 13
+
+# RME items.h itemattrib_t: ITEM_ATTR_TOPORDER (order within "always on bottom" block; lower = drawn first).
+ITEM_ATTR_TOPORDER = 0x2B
 
 ITEM_GROUP_NONE = 0x00
 ITEM_GROUP_GROUND = 0x01
@@ -249,8 +254,21 @@ def generate_items_otb(items, output_path):
         # Build item node
         item_data = bytearray()
         
-        # Flags (4 bytes, uint32): RME reads FLAG_STACKABLE so getCount() returns subtype and count is editable
+        # Flags (4 bytes, uint32): RME reads FLAG_STACKABLE; FLAG_ALWAYSONTOP sets alwaysOnBottom (stack order, see FLAG_ATTRIBUTE_MAPPING.md)
         otb_flags = FLAG_STACKABLE if 'Cumulative' in flags else 0
+        # Clip/Bottom/Top/Height (not Bank) -> alwaysOnBottom + topOrder so RME puts them in bottom block
+        top_order = None
+        if 'Bank' not in flags:
+            if 'Clip' in flags:
+                top_order = 1
+            elif 'Bottom' in flags:
+                top_order = 2
+            elif 'Top' in flags:
+                top_order = 3
+            elif 'Height' in flags:
+                top_order = 4
+        if top_order is not None:
+            otb_flags |= FLAG_ALWAYSONTOP
         item_data.extend(struct.pack('<I', otb_flags))
         
         # ServerID attribute (map/server type id)
@@ -290,6 +308,12 @@ def generate_items_otb(items, output_path):
             item_data.append(ITEM_ATTR_MAXITEMS)
             item_data.extend(struct.pack('<H', 2))  # length
             item_data.extend(struct.pack('<H', volume))
+        
+        # ITEM_ATTR_TOPORDER (u8): order within RME "always on bottom" block (Clip=1, Bottom=2, Top=3, Height=4)
+        if top_order is not None:
+            item_data.append(ITEM_ATTR_TOPORDER)
+            item_data.extend(struct.pack('<H', 1))  # datalen = 1 byte
+            item_data.append(top_order & 0xFF)
         
         # Escape and write item node
         escaped = escape_otb_data(item_data)

@@ -4,3 +4,4 @@ output/
 RME/
 __pycache__/
 *.pyc
+docs/

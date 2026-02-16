@@ -19,6 +19,6 @@ Convert Open Tibia Map Binary to and from Official CipSoft Sector Map files
 
 Prefer no wall when shifting spawns
 
-Sometimes items below 
+Liquids seem wrong sometimes 
 
 parse moveuse.dat (whats the different between those and absteleportdestination ?)

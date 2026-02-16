@@ -642,6 +642,78 @@ def _write_debug_attributes_log():
         f.writelines(lines)
 
 
+# Engine stack order (map.hh: Bank=0, Clip=1, Bottom=2, Top=3, Creature=4, Low=5).
+# We add Height=4 from objects.srv so Height-only items (e.g. small table) sort before Low (cup on top).
+STACK_PRIORITY_BANK = 0
+STACK_PRIORITY_CLIP = 1
+STACK_PRIORITY_BOTTOM = 2
+STACK_PRIORITY_TOP = 3
+STACK_PRIORITY_HEIGHT = 4
+STACK_PRIORITY_LOW = 5
+
+
+def load_item_stack_priority(objects_srv_path):
+    """Parse objects.srv; return dict type_id -> stack priority (0=Bank .. 5=Low).
+    Used so sec->OTBM writes canonical engine order; OTBM->sec would use same sort."""
+    path = Path(objects_srv_path)
+    if not path.exists():
+        return {}
+    type_to_priority = {}
+    current_type_id = None
+    with open(path, 'r', encoding='latin-1', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith('TypeID'):
+                match = re.search(r'TypeID\s*=\s*(\d+)', line)
+                if match:
+                    current_type_id = int(match.group(1))
+            elif current_type_id is not None and line.startswith('Flags'):
+                match = re.search(r'Flags\s*=\s*\{([^}]*)\}', line)
+                if match:
+                    flags_str = match.group(1)
+                    flags = {s.strip().lower() for s in flags_str.split(',')}
+                    if 'bank' in flags:
+                        p = STACK_PRIORITY_BANK
+                    elif 'clip' in flags:
+                        p = STACK_PRIORITY_CLIP
+                    elif 'bottom' in flags:
+                        p = STACK_PRIORITY_BOTTOM
+                    elif 'top' in flags:
+                        p = STACK_PRIORITY_TOP
+                    elif 'height' in flags:
+                        p = STACK_PRIORITY_HEIGHT
+                    else:
+                        p = STACK_PRIORITY_LOW
+                    type_to_priority[current_type_id] = p
+                current_type_id = None
+    return type_to_priority
+
+
+def _sort_tile_items_by_priority(items, type_to_priority):
+    """Stable-sort tile items by engine stack priority. Same priority = keep original order."""
+    if not items or not type_to_priority:
+        return items
+    def key(item):
+        return type_to_priority.get(item.get('id'), STACK_PRIORITY_LOW)
+    return sorted(items, key=key)
+
+
+def _reverse_trailing_low_group(items, type_to_priority):
+    """Reverse the contiguous trailing block of LOW-priority items.
+    .sec has same-priority (e.g. meat, plate) as first=bottom; RME first=bottom. So we need
+    plate then meat in OTBM so RME draws plate (bottom), meat (top). Hence reverse LOW tail."""
+    if not items or not type_to_priority or len(items) < 2:
+        return items
+    def priority(item):
+        return type_to_priority.get(item.get('id'), STACK_PRIORITY_LOW)
+    i = len(items)
+    while i > 0 and priority(items[i - 1]) == STACK_PRIORITY_LOW:
+        i -= 1
+    if i < len(items):
+        items = items[:i] + list(reversed(items[i:]))
+    return items
+
+
 def load_all_sectors(sec_dir):
     """Load all .sec files and organize by sector"""
     sec_dir = Path(sec_dir)
@@ -770,8 +842,9 @@ def _write_otbm_item_recursive(writer, item_data, counters):
     counters['total_items'] += 1
 
 
-def convert_map_to_otbm(sectors, output_file, map_name, towns=None, house_positions=None):
-    """Convert .sec files to OTBM format. house_positions: dict (x,y,z) -> house_id for OTBM_HOUSETILE."""
+def convert_map_to_otbm(sectors, output_file, map_name, towns=None, house_positions=None, item_stack_priority=None):
+    """Convert .sec files to OTBM format. house_positions: dict (x,y,z) -> house_id for OTBM_HOUSETILE.
+    item_stack_priority: optional dict type_id -> priority from load_item_stack_priority(objects.srv); if set, tile items are sorted by engine priority before writing (semantic lossless)."""
     
     print("\n" + "="*70)
     print("CONVERTING MAP TO OTBM")
@@ -870,8 +943,13 @@ def convert_map_to_otbm(sectors, output_file, map_name, towns=None, house_positi
                 writer.write_byte(OTBM_ATTR_TILE_FLAGS)
                 writer.write_uint32(tile['map_flags'])
             
-            # RME draws first item = bottom of stack, last = top. .sec lists bottom-first (ground, then furniture, then items on top), so use same order.
-            for item_data in items:
+            # Flags + reverse whole: sort by engine priority, then reverse whole tile list. RME uses flags (alwaysOnBottom/topOrder) so bottom-block items go below; reversed order gives correct stack (see LOSSLESS_ROUNDTRIP.md, FLAG_ATTRIBUTE_MAPPING.md).
+            if item_stack_priority:
+                items_to_write = _sort_tile_items_by_priority(items, item_stack_priority)
+                items_to_write = list(reversed(items_to_write))
+            else:
+                items_to_write = items
+            for item_data in items_to_write:
                 _write_otbm_item_recursive(writer, item_data, counters)
             
             writer.end_node()
@@ -1513,13 +1591,22 @@ def main():
         if house_positions:
             print(f"\n✓ House tiles: {len(house_positions)} positions from houses.dat Fields")
     
+    # Stack order: sort tile items by engine priority (objects.srv) for semantic lossless sec↔OTBM
+    objects_srv = dat_dir / 'objects.srv'
+    item_stack_priority = load_item_stack_priority(objects_srv) if objects_srv.exists() else None
+    if item_stack_priority:
+        print(f"\n✓ Stack order: loaded priorities for {len(item_stack_priority)} types from objects.srv")
+    else:
+        print(f"\n⚠ Stack order: objects.srv not found, writing tile items in .sec order (no priority sort)")
+    
     # Convert map (with house tiles so RME creates House objects)
     convert_map_to_otbm(
         sectors,
         output_dir / f'{output_name}.otbm',
         output_name,
         towns=towns,
-        house_positions=house_positions
+        house_positions=house_positions,
+        item_stack_priority=item_stack_priority
     )
     
     # Generate houses XML (name, entry, rent, townid - applied to houses created from OTBM)
