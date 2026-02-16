@@ -346,7 +346,12 @@ def generate_items_xml(items, output_path):
             item_elem.set('type', 'door')
         elif 'Depot' in flags:
             item_elem.set('type', 'depot')
-    
+        # RME uses canWriteText/canReadText to show text editor; set via <attribute key="writeable" value="1" /> (items.cpp)
+        if 'Text' in flags:
+            attr_elem = etree.SubElement(item_elem, 'attribute')
+            attr_elem.set('key', 'writeable')
+            attr_elem.set('value', '1')
+
     tree = etree.ElementTree(root)
     tree.write(output_path, encoding='utf-8', xml_declaration=True, pretty_print=True)
     
