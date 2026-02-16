@@ -9,7 +9,7 @@ Convert Open Tibia Map Binary to and from Official CipSoft Sector Map files
 `duplicate spawn non position 32666 31676 15`
 
 ### Stone wall for spawn sprite
-`1507 stone wall hardcoded into RME`
+`1507 stone wall hardcoded into RME (Same with with temple marker)`
 
 ### Omitted RemainingExpireTime on pools/SavedExpireTime on torches
 `No sensible field & server gives default`
